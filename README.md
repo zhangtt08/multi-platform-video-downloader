@@ -1,122 +1,115 @@
-# qingying-downloader (清影下载器)
+# 🎬 轻影下载器 (QingYing Downloader)
 
-A Windows desktop downloader that pairs **yt-dlp** (video) with **gallery-dl** (images) — with one-click cookie login for Bilibili, Douyin, TikTok, Instagram and Xiaohongshu.
-Windows 桌面视频/图片下载器：yt-dlp / gallery-dl 双引擎，B站 / 抖音 / TikTok / Instagram / 小红书一键登录会话。
+<p align="center">
+  <img src="./renderer/assets/app-icon.png" width="96" height="96" alt="轻影下载器图标" />
+</p>
 
-Sites like Bilibili (risk control), Douyin (`modal_id` URLs), TikTok (anti-crawler JS challenge) and Instagram (forced login) break naive command-line downloads. **qingying-downloader** wraps both engines in an Electron GUI, keeps a per-site login session in a persisted browser partition, injects those cookies into every engine call, and automatically falls back from yt-dlp to gallery-dl when a link turns out to be images.
+<p align="center">
+  <b>全网多平台无水印视频与高清原图批量下载神器</b><br>
+  内置 <code>yt-dlp</code> 与 <code>gallery-dl</code> 双下载内核 · 一键解析下载 抖音 / B站(4K) / 小红书 / TikTok / YouTube / Instagram<br>
+  100% 纯本地运行 · 登录态本地安全存储 · 永久免费开源
+</p>
 
-[中文说明](README.zh-CN.md)
+<p align="center">
+  <a href="./README.en.md">English Documentation</a> | <b>简体中文</b>
+</p>
 
-![License](https://img.shields.io/badge/license-MIT-green)
-![Platform](https://img.shields.io/badge/platform-Windows-blueviolet)
-![Electron](https://img.shields.io/badge/Electron-47848F?logo=electron&logoColor=white)
-![yt-dlp](https://img.shields.io/badge/engine-yt--dlp-642CA9)
-![gallery-dl](https://img.shields.io/badge/engine-gallery--dl-44A833)
-![ffmpeg](https://img.shields.io/badge/ffmpeg-6.1.1-007808?logo=ffmpeg&logoColor=white)
+<p align="center">
+  <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License" />
+  <img src="https://img.shields.io/badge/Platform-Windows%2010%2B-0078D6?logo=windows&logoColor=white" alt="Platform" />
+  <img src="https://img.shields.io/badge/双引擎-yt--dlp%20%2B%20gallery--dl-red" alt="Dual Engines" />
+  <img src="https://img.shields.io/badge/画质-最高支持%204K%2F8K-brightgreen" alt="Quality" />
+  <img src="https://img.shields.io/badge/100%25-纯本地安全-success" alt="Local Security" />
+  <img src="https://img.shields.io/badge/Agent-MCP%20Ready-orange" alt="MCP" />
+</p>
 
-## ✨ Features
+---
 
-- **Dual engine** — yt-dlp for video; gallery-dl takes over automatically for images when yt-dlp fails or returns nothing
-- **Format picker** — separate video / audio stream selection with optional ffmpeg merge
-- **Five login sessions** — Bilibili, Douyin, TikTok, Instagram, Xiaohongshu: log in once in the in-app window; cookies are injected into engine calls (helps when Bilibili risk control blocks anonymous API access)
-- **YouTube and beyond** — public YouTube links and anything else yt-dlp supports work without login
-- **TikTok anti-crawl** — built-in browser UA to pass the anti-crawler JS challenge
-- **Reliable image saving** — files are written via Node's native `https` module instead of Electron's `net.fetch`, which can hang on large downloads
-- **Download queue with progress**
+## 🎯 为什么选择轻影下载器？
 
-## 🔒 Pinned tool versions
+很多创作者和普通用户在下载视频素材时，常常遇到以下痛点：
+1. **第三方网页解析陷阱重重**：充斥弹窗广告、诱导付费、画质严重压缩，甚至暗藏恶意木马。
+2. **账号隐私泄露风险**：要求你手动提取并上传 Cookie，随时可能导致账号异地登录、被盗或被平台封禁。
+3. **图集与视频无法兼顾**：遇到小红书多图笔记、Instagram 轮播图或 B站 4K 画质时，普通工具要么报错，要么只能下缩略图。
+4. **命令行工具门槛过高**：`yt-dlp` 和 `gallery-dl` 虽然强大，但对普通用户来说命令行参数繁复难记，反爬风控一变就无从下手。
 
-Do not bump these casually — newer releases are known to regress:
+**轻影下载器专为解决这些问题而生！**  
+它将业界最顶尖的两个开源引擎打包进颜值极高、操作极简的 Windows 桌面客户端，让你只需粘贴一个链接，就能自动把超清视频或原图带回家！
 
-| Tool | Version | Reason |
-|---|---|---|
-| yt-dlp | 2026.07.04 | The 2026.08.19 build breaks TikTok parsing in practice and does not fix Bilibili HTTP 412 |
-| gallery-dl | 1.31.10 | Newer releases no longer ship a Windows exe |
-| ffmpeg | 6.1.1 | Reuses the copy bundled with the packaged app |
+---
 
-## 🏗️ Architecture
+## ✨ 核心特性
 
+| 功能模块 | 亮点说明 |
+| :--- | :--- |
+| 🚀 **双内核智能自动降级** | 视频优先调用 `yt-dlp` 高速下载；遇到图集或多图笔记自动无缝回退至 `gallery-dl`，图文全搞定！ |
+| 💎 **画质无损与音频合并** | 支持自动将最佳视频流与最佳音频流进行无损合并，支持 B站 4K/1080P60 极清画质！ |
+| 🔑 **五大平台安全会话持久化** | 应用内集成隔离浏览器环境，支持一键登录 B站、抖音、小红书、TikTok、Instagram，Cookie **全本地存储，绝不外泄**！ |
+| 🛡️ **独家反爬虫机制对抗** | 深度优化请求头与浏览器指纹，轻松绕过 TikTok JS challenge、抖音 `modal_id` 鉴权与小红书反爬拦截 |
+| 📋 **极简下载队列** | 支持实时查看下载进度、下载速率、剩余时间与状态，一键直接打开所在下载文件夹 |
+| 🤖 **AI Agent & MCP 支持** | 内置本地 API 网关与 MCP 协议服务，支持让 Cursor、Claude Code、智能体自动批量搜索并拉取创作素材 |
+
+---
+
+## 🌐 支持的平台与内容
+
+* **抖音 (Douyin)**：无水印单视频、实况视频、图集无水印原图批量下载。
+* **哔哩哔哩 (Bilibili)**：支持最高 4K / 1080P60 高码率下载，音视频自动无缝合成，支持分 P 批量解析。
+* **小红书 (Xiaohongshu)**：无水印原图批量下载、视频无水印原画导出。
+* **YouTube**：支持 4K/8K 视频下载、独立音轨提取 (MP3/M4A)、字幕抓取。
+* **TikTok**：穿透海外地区与风控验证，一键下载无水印高清视频。
+* **Instagram**：帖子单图/多图、Reels 短视频全格式抓取。
+* **海量站点扩展**：原生兼容 `yt-dlp` 支持的 1000+ 主流媒体网站。
+
+---
+
+## 🚀 快速上手
+
+### 方式一：直接运行桌面客户端（推荐）
+1. 双击运行根目录或桌面上的 **`轻影.exe`**。
+2. 首次使用可在左侧「平台登录」中登录你的账号（获取更高清晰度权限，如 B站大会员 4K）。
+3. 在顶部输入框粘贴想要下载的分享链接，点击 **「解析并下载」** 即可！
+
+### 方式二：开发者源码运行
+确保系统已安装 Node.js 18+：
+
+```bash
+# 1. 克隆代码仓库
+git clone https://github.com/zhangtt08/multi-platform-video-downloader.git
+cd multi-platform-video-downloader
+
+# 2. 安装项目依赖
+npm install
+
+# 3. 启动应用
+npx electron .
 ```
-electron/main.cjs        Main process — window, IPC, download queue, cookie injection, API startup
-electron/engine-core.cjs Shared engine core: both the UI and the agent APIs call this (analysis, args, progress, storage, path guards)
-electron/local-guard.cjs The one local-service guard both APIs run through (Host / Origin / token / loopback bind)
-electron/agent-api.cjs   In-app HTTP API (127.0.0.1:8392) — reuses the running app's engines and sessions
-electron/preload.cjs     Preload bridge (named methods only, no node in the renderer)
-agent/server.mjs         Standalone headless Agent API (127.0.0.1:8793)
-agent/tools.mjs          Its 8 schema'd tools            agent/mcp-server.mjs  MCP stdio bridge
-renderer/                UI (index.html / app.js / styles.css / icons)
-scripts/check.cjs        npm run check — static + core behaviour assertions
-scripts/verify.cjs       npm run verify — behavioural gates (guard, docs-vs-code)
-scripts/build.cjs        npm run build / npm run dist — pack + assemble + artifact assertions
+
+---
+
+## 🤖 自动化与 Agent API (MCP 协议)
+
+轻影下载器原生支持本地自动化调度，非常适合自媒体工作流、AI 批量创作管线：
+
+```bash
+# 启动面向 Agent 的 API 服务（默认端口 8793）
+npm run agent:serve
 ```
 
-Pipeline: renderer → IPC → URL normalization (e.g. Douyin share links) → engine selection (yt-dlp for video, gallery-dl fallback for images) → format list → download queue with progress events → ffmpeg merge if needed.
+* **MCP 桥接**：运行 `npm run agent:mcp`，即可以 stdio 方式接入 Cursor、Claude Code 或 Antigravity。
+* **支持工具**：
+  * `qingying.analyze`：传入视频 URL，返回标题、作者、封面以及清晰度格式列表
+  * `qingying.download`：提交下载任务到后台队列，自动调用对应平台已登录的 Cookie
+  * `qingying.status`：查询下载进度与任务状态
 
-## 🚀 Getting started
+---
 
-This repository is the app source (it is what gets packed into `resources/app.asar`), and it has a real build chain — `npm run build` to validate and assemble, `npm run dist` to also produce an installer.
+## ⭐ 支持与社区
 
-Run from source (Windows):
+如果轻影下载器帮您解决了视频下载和素材采集的烦恼，请为本项目点亮一颗 **Star ⭐**！您的支持是它持续维护对抗反爬策略的最大动力。
 
-```powershell
-git clone https://github.com/zhangtt08/qingying-downloader.git
-cd qingying-downloader
-npm install     # devDependencies: electron 37.10.3, @electron/asar, electron-builder
-npm start       # same thing as: npx electron .
-```
+---
 
-The engine binaries (yt-dlp / gallery-dl / ffmpeg) are **not** in this repo — `/resources/` is gitignored, and the pinned exes belong to the machine or to the installer. Put them in `resources/bin/` (or on `PATH`), or point 设置 → 指定引擎目录 at the folder that already has them. Without them the app reports each engine as 未安装 instead of pretending. `npm install ffmpeg-static` is optional: `main.cjs` requires it inside a `try/catch`, so its absence only removes that fallback.
+## 📄 开源许可证
 
-### Build and package
-
-| Command | What it produces |
-|---|---|
-| `npm run build` | `dist/app.asar` (drop-in replacement for the packaged app's `resources/app.asar`) and `dist/win-unpacked/` — an unpacked, runnable app dir whose executable is `清影下载器.exe`; `resources/bin/*.exe` is copied in when those engines are present, and its absence is printed instead of hidden |
-| `npm run dist` | the same, plus the NSIS installer `dist/qingying-downloader-<version>-win-x64.exe` (measured here: 89 MB, Electron 37.10.3) |
-
-Both are the same script (`scripts/build.cjs`, one extra flag), every step prints PASS/FAIL, and the build checks its own output: the bytes inside the produced asar must equal the repo sources, and no settings/history/cookie file may enter an artifact. `dist/` is gitignored, so building never dirties the tree.
-
-The old instructions in this file pointed at `npx asar extract C:\software\QingYingDownloader\resources\app.asar` — a path that exists only on one other machine, and there was no script behind it. They are gone: to patch an existing install in place, run `npm run build` and copy `dist/app.asar` over that install's `resources/app.asar`.
-
-
-## 📄 License
-
-[MIT](LICENSE)
-
-## 🤖 Agent API
-
-While the app is running, a local HTTP API is available on `127.0.0.1:8392`. It reuses the app's yt-dlp / gallery-dl engines **and its per-site login sessions** (Douyin / TikTok / Bilibili / Xiaohongshu / Instagram cookies), so logged-in downloads work the same as in the UI. A second, headless agent surface (`npm run agent:serve`, port `8793`) exposes the same engine core as schema'd tools plus an MCP stdio bridge.
-
-| Endpoint | Method | Body | Result |
-|---|---|---|---|
-| `/health` | GET | — | version + engines + what the guard itself enforces |
-| `/api/status` | GET | — | the API's real bind state (listening / port / error) |
-| `/api/queue` | GET | — | current queue snapshot |
-| `/api/analyze` | POST | `{url}` + token header | title / uploader / `videos[]` + `audios[]` formats, or a gallery-dl image list |
-| `/api/download` | POST | `{url, outputDir, mode: "combined"\|"video"\|"audio"\|"images", videoId?, audioId?, audioFormat?, images?}` + token header | `{files: [saved paths]}` |
-
-Port override: `QINGYING_API_PORT`.
-
-### How many downloads run at once (measured, not aspirational)
-
-Concurrency comes from one place: `settings.concurrency`, **default 2, configurable 1–4** (`DEFAULT_SETTINGS.concurrency` in `electron/engine-core.cjs`, clamped by `clampInt(value, 1, 4, 2)`; the same selector as the UI's 并发 field). `pumpQueue()` in `electron/main.cjs` starts queued tasks while fewer than that many are in flight; the rest stay `queued`.
-
-`POST /api/download` enqueues into that same queue and returns when **its own** task reaches a terminal state, so a request that arrives while another download is running is **not** rejected: there is no "one at a time" limit and **no 409 on collision**. Status codes are only these: `200` task done, `403` the guard or the download-root check refused the request, `409` *this* task ended cancelled/paused, `502` the engine failed. Two callers waiting in parallel is the normal case, not an error.
-
-The headless agent on `8793` is a separate process: it shares `settings.json`/`history.json` with the UI but runs each `qingying.download` inline in its own process, so the app's `concurrency` number does not throttle it — N simultaneous requests there mean N engine calls.
-
-### What the local API refuses, and why it can
-
-The API downloads with the user's logged-in sessions, so "it only binds 127.0.0.1" is not a boundary — any local process, and any web page via a cross-origin POST, can reach a loopback port. Both surfaces therefore run the same guard (`electron/local-guard.cjs`):
-
-- **Loopback only** — binding to a non-loopback host is refused outright, not warned about.
-- **Literal `Host` allowlist** — `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`; anything else gets `403 HOST_NOT_ALLOWED`. The Origin check is never compared against the request's own Host, because that equality is exactly what DNS rebinding produces.
-- **Foreign `Origin`/`Referer` → `403` with a JSON body** — a browser tab cannot drive the downloader.
-- **Token on every non-GET** — `x-qingying-token: <token>` (or `Authorization: Bearer`). The token lives in per-user app-data at `%APPDATA%\qingying-downloader\qingying\agent-api.token`, created with mode `0600` on first use, so the MCP bridge and CLI callers keep working without anyone exporting an environment variable. `QINGYING_API_TOKEN` overrides the file. If the token cannot be read or created, writes fail closed with `503 TOKEN_UNAVAILABLE` — the absence of a secret never opens the door.
-- **`outputDir` is contained** — it must resolve (after `realpath`) inside a download root the user designated, i.e. the folder in the app's 保存位置 setting (`settings.outputDir`, plus optional `allowedOutputRoots` / `QINGYING_DOWNLOAD_ROOTS`). Anything else — an unrelated absolute path, `..\` traversal, a junction inside the root pointing outside it — is refused with `403 output_dir_outside_root`, and the message names the allowed roots and how to change them. No directory is created before the check passes.
-- **No wildcard CORS** on mutating routes; nothing is echoed back except status, sizes and paths.
-
-Cookie values never leave the process: `/health`, `/api/status`, the agent tools and the UI report login state, cookie *names* and expiry only.
-
-
-## 📄 License
+本项目基于 [MIT License](./LICENSE) 协议开源。请勿用于商业侵权或盗版用途，请遵守各平台服务协议与版权规范。

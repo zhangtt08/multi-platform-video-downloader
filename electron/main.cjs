@@ -1,4 +1,4 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, net, session, shell } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, net, screen, session, shell } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const core = require('./engine-core.cjs');
@@ -63,15 +63,19 @@ function sendToMain(channel, payload) {
 }
 
 function createWindow() {
+  const workArea = screen.getPrimaryDisplay().workAreaSize;
+  const width = Math.max(760, Math.min(1180, workArea.width - 32));
+  const height = Math.max(600, Math.min(820, workArea.height - 32));
   mainWindow = new BrowserWindow({
-    width: 1180,
-    height: 820,
-    minWidth: 800,
-    minHeight: 640,
+    width,
+    height,
+    minWidth: Math.min(760, width),
+    minHeight: Math.min(600, height),
+    center: true,
     show: false,
     title: '清影下载器',
     icon: path.join(__dirname, '..', 'renderer', 'assets', 'app-icon.png'),
-    backgroundColor: '#06101c',
+    backgroundColor: '#ffffff',
     autoHideMenuBar: true,
     frame: false,
     webPreferences: {
@@ -207,6 +211,7 @@ async function analyzeMedia(payload) {
     result = await core.analyzeUrl({
       url,
       engines,
+      proxy: settings.proxy,
       preference: core.safeText(payload?.engine_preference, 20) || settings.enginePreference,
       cookieProvider: async (site) => {
         const file = await cookieFileForSite(site);
@@ -443,6 +448,9 @@ async function runTask(task) {
     subfolderByPost: settings.subfolderByPost,
     retries: 20,
     concurrentFragments: 3,
+    proxy: settings.proxy,
+    embedMetadata: settings.embedMetadata,
+    writeSubtitles: settings.writeSubtitles,
   };
 
   let result;
@@ -964,17 +972,19 @@ if (!hasSingleInstanceLock) {
   app.whenReady().then(async () => {
     app.setAppUserModelId('com.qingying.downloader');
     core.ensureDirSync(DATA_DIR());
+    // 默认下载目录在首帧前就落盘，避免第一次打开时目录框是空的。
+    try {
+      if (!core.readSettings(DATA_DIR()).outputDir) {
+        core.writeSettings(DATA_DIR(), { outputDir: app.getPath('downloads') });
+      }
+    } catch (error) {
+      console.error('[qingying] 默认下载目录写入失败：' + (error && error.message ? error.message : String(error)));
+    }
     createWindow();
     await probeEngines();
     const snapshot = await collectAuthSnapshot();
     sendToMain('auth:changed', snapshot);
     emitEngines();
-    // 默认下载目录：用户没设过就落到"下载"，避免第一次点下载卡在"请选择目录"。
-    const settings = core.readSettings(DATA_DIR());
-    if (!settings.outputDir) {
-      core.writeSettings(DATA_DIR(), { outputDir: app.getPath('downloads') });
-      emitQueue(true);
-    }
     // 应用内接口的启动结果必须如实交出去：端口被占时以前是 on('error',()=>{}) + 空 catch，
     // 表现是"文档说接口在 8392，实际什么都没有"，界面与接口都不报错。
     const apiPort = Number(process.env.QINGYING_API_PORT) || DEFAULT_API_PORT;

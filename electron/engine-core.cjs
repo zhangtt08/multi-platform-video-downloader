@@ -864,6 +864,7 @@ async function analyzeWithYtDlp(spec) {
   const site = matchLoginSite(url);
   if (site && site.userAgent) args.push('--user-agent', site.userAgent);
   if (cookieFile) args.push('--cookies', cookieFile);
+  if (spec.proxy) args.push('--proxy', spec.proxy);
   args.push(url);
 
   const { stdout } = await runTool(executable, args, { timeoutMs: timeoutMs || 120000 });
@@ -895,8 +896,9 @@ async function analyzeWithYtDlp(spec) {
 }
 
 async function analyzeWithGalleryDl(spec) {
-  const { url, executable, cookieFile, timeoutMs } = spec;
+  const { url, executable, cookieFile, timeoutMs, proxy } = spec;
   const args = ['-j', '--no-colors'];
+  if (proxy) args.push('--proxy', proxy);
   const site = matchLoginSite(url);
   if (cookieFile) args.push('--cookies', cookieFile);
   args.push(url);
@@ -1056,8 +1058,8 @@ async function analyzeUrl(spec) {
       : (step.engine === 'yt-dlp' ? 'yt-dlp' : 'gallery-dl');
     try {
       const result = step.engine === 'yt-dlp'
-        ? await analyzeWithYtDlp({ url, executable, cookieFile, timeoutMs: spec.timeoutMs })
-        : await analyzeWithGalleryDl({ url, executable, cookieFile, timeoutMs: spec.timeoutMs });
+        ? await analyzeWithYtDlp({ url, executable, cookieFile, timeoutMs: spec.timeoutMs, proxy: spec.proxy })
+        : await analyzeWithGalleryDl({ url, executable, cookieFile, timeoutMs: spec.timeoutMs, proxy: spec.proxy });
 
       if (!result) {
         attempts.push({ engine: step.engine, outcome: 'no_result', ms: Date.now() - startedAt, detail: step.reason });
@@ -1162,6 +1164,9 @@ function buildDownloadArgs(spec) {
   ];
   if (spec.site && spec.site.userAgent) args.push('--user-agent', spec.site.userAgent);
   if (spec.cookieFile) args.push('--cookies', spec.cookieFile);
+  if (spec.proxy) args.push('--proxy', spec.proxy);
+  if (spec.embedMetadata) args.push('--embed-metadata');
+  if (spec.writeSubtitles) args.push('--write-subs', '--sub-langs', 'all,-live_chat');
 
   if (mode === 'combined') {
     if (spec.videoHasAudio) {
@@ -1491,6 +1496,7 @@ function runGalleryDlDownload(spec, hooks) {
   const args = ['--no-colors', '-D', spec.outputDir];
   if (spec.cookieFile) args.push('--cookies', spec.cookieFile);
   if (spec.site && spec.site.userAgent) args.push('--user-agent', spec.site.userAgent);
+  if (spec.proxy) args.push('--proxy', spec.proxy);
   args.push(spec.url);
 
   return new Promise((resolve) => {
@@ -1649,6 +1655,9 @@ const DEFAULT_SETTINGS = {
   autoRetry: 2,
   enginePreference: 'auto',
   audioFormat: 'mp3',
+  proxy: '',
+  embedMetadata: false,
+  writeSubtitles: false,
   exportCookiesForCli: false,
   // 引擎所在目录（打包版的 resources/bin）。留空则按 env -> 项目内 resources -> PATH 找。
   enginesDir: '',
@@ -1703,6 +1712,10 @@ function readSettingsFromValue(value) {
   merged.autoRetry = clampInt(merged.autoRetry, 0, 5, 2);
   if (!['auto', 'yt-dlp', 'gallery-dl'].includes(merged.enginePreference)) merged.enginePreference = 'auto';
   if (!AUDIO_FORMATS.includes(merged.audioFormat)) merged.audioFormat = 'mp3';
+  if (typeof merged.proxy !== 'string') merged.proxy = '';
+  merged.proxy = safeText(merged.proxy, 200).trim();
+  if (typeof merged.embedMetadata !== 'boolean') merged.embedMetadata = false;
+  if (typeof merged.writeSubtitles !== 'boolean') merged.writeSubtitles = false;
   if (typeof merged.subfolderByPost !== 'boolean') merged.subfolderByPost = false;
   if (typeof merged.exportCookiesForCli !== 'boolean') merged.exportCookiesForCli = false;
   const template = validateFilenameTemplate(merged.filenameTemplate);
@@ -1825,7 +1838,10 @@ function resolveContainedOutputDir(candidate, roots, options) {
   if (!projected) {
     return { ok: false, code: 'output_dir_unreachable', resolved: target, root: '', error: '下载目录连最近的上级目录都读不出来：' + target + '。请先在界面里指定一个真实存在的下载根目录。' };
   }
-  const hit = realRoots.find((entry) => pathIsInside(entry.real, projected));
+  // create:true（Agent 工具显式要求"允许创建"）时，目标可能还不存在：按最近的已存在上级判归属，
+  // 与 mkdir 的语义一致；否则"下载根目录下还没建出来的子目录"会被误判成越界。
+  const containmentTarget = opts.create && !fs.existsSync(target) ? (projectRealPath(path.dirname(target), impl) || projected) : projected;
+  const hit = realRoots.find((entry) => pathIsInside(entry.real, containmentTarget));
   if (!hit) {
     return {
       ok: false,

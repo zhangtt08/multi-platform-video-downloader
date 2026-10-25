@@ -55,6 +55,7 @@ const elements = {
   settingConcurrency: document.querySelector('#setting-concurrency'),
   settingRetry: document.querySelector('#setting-retry'),
   settingEngine: document.querySelector('#setting-engine'),
+  settingProxy: document.querySelector('#setting-proxy'),
 
   folder: document.querySelector('#folder'),
   chooseFolder: document.querySelector('#choose-folder'),
@@ -100,6 +101,73 @@ let engines = null;
 let history = [];
 let contextSiteId = '';
 let lastFinishedKey = '__none__';
+
+const views = [...document.querySelectorAll('.view')];
+const railButtons = [...document.querySelectorAll('.rail-button')];
+const filterButtons = [...document.querySelectorAll('[data-queue-filter]')];
+const workspace = document.querySelector('.workspace');
+let queueFilter = 'all';
+
+const ICONS = {
+  pause: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 7v10M14.5 7v10"/></svg>',
+  play: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7.2 16.5 12 9 16.8Z"/></svg>',
+  retry: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12a7 7 0 1 1-2.1-5"/><path d="M19 4.5V9h-4.5"/></svg>',
+  folder: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.8h5.5l2 2h9.5v9.7h-17z"/></svg>',
+  dots: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6.5" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="17.5" cy="12" r="1.5" fill="currentColor" stroke="none"/></svg>',
+  copy: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6A2 2 0 0 0 13.5 4h-7A2 2 0 0 0 4.5 6v7a2 2 0 0 0 2 2H8.5"/></svg>',
+  download: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10M8 10.5l4 4 4-4"/><path d="M5.5 19.5h13"/></svg>',
+  check: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 12.5 4 4 8-9"/></svg>',
+  alert: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4 3.5 19h17Z"/><path d="M12 9.5v4.4M12 16.7v.2"/></svg>',
+  clock: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 7.5V12l3 2"/></svg>',
+  close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 6.5h15M9 6.5V4.8h6v1.7M6.5 6.5l.8 13h9.4l.8-13"/><path d="M10 10.5v5.5M14 10.5v5.5"/></svg>',
+  file: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 3.5h7l4 4v13h-11z"/><path d="M13.5 3.5v4h4"/></svg>',
+};
+
+const STATUS_ICONS = {
+  queued: 'clock',
+  downloading: 'download',
+  paused: 'pause',
+  done: 'check',
+  failed: 'alert',
+  cancelled: 'close',
+};
+
+const MODE_LABELS = {
+  combined: '视频 + 音频',
+  video: '仅视频',
+  audio: '仅音频',
+  images: '图集',
+};
+
+const QUICK_SITE_LABELS = { youtube: 'YouTube' };
+
+function iconNode(name) {
+  const holder = document.createElement('template');
+  holder.innerHTML = ICONS[name] || '';
+  return holder.content.firstElementChild;
+}
+
+function switchView(name) {
+  for (const view of views) view.classList.toggle('hidden', view.dataset.view !== name);
+  for (const button of railButtons) {
+    const active = button.dataset.view === name;
+    button.classList.toggle('active', active);
+    if (active) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  }
+  if (workspace) workspace.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function setQueueFilter(name) {
+  queueFilter = name;
+  for (const button of filterButtons) {
+    const active = button.dataset.queueFilter === name;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+  }
+  renderQueue();
+}
 
 // ── 基础状态 ──────────────────────────────────────────────────────────────
 function setStatus(message, type = '') {
@@ -530,6 +598,7 @@ function showParseError(result) {
   }
   setWorkflow(1, 'current');
   setStatus(`解析没有成功（${kindLabel(result.kind)}），下面给出可以点下一步的动作。`, 'error');
+  setTimeout(() => elements.errorCard.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
 }
 
 const REMEDY_LABELS = {
@@ -571,9 +640,11 @@ function runRemedy(remedy, result) {
       setStatus('诊断信息已复制到剪贴板。', 'success');
       break;
     case 'install_engine':
+      switchView('settings');
       void probeEngines().then(() => elements.engineList.scrollIntoView({ behavior: 'smooth', block: 'center' }));
       break;
     case 'update_engine':
+      switchView('settings');
       void probeEngines().then(() => {
         elements.engineList.scrollIntoView({ behavior: 'smooth', block: 'center' });
         setStatus('已列出本机引擎版本。站点改版时先升级 yt-dlp / gallery-dl（例如 yt-dlp -U），再点"重新探测"。');
@@ -582,6 +653,7 @@ function runRemedy(remedy, result) {
     case 'check_page_type':
     case 'copy_link':
     case 'fix_url':
+      switchView('home');
       elements.url.focus();
       elements.url.select();
       setStatus('请把链接换成打开某一条具体内容后复制到的地址。');
@@ -631,6 +703,7 @@ async function analyze(preferenceOverride) {
   renderMedia();
   updateContextChips();
   setStatus('解析完成，可以选择格式和保存位置。', 'success');
+  setTimeout(() => elements.mediaCard.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
   return { ok: true, data: media };
 }
 
@@ -831,35 +904,58 @@ async function enqueueCurrent() {
     return;
   }
   setWorkflow(3);
+  setQueueFilter('all');
+  switchView('queue');
   setStatus(`已加入队列，共 ${result.tasks.length} 个任务。`, 'success');
 }
 
 function renderQueue(snapshot) {
   if (snapshot) queue = snapshot;
+  const openMenu = elements.taskList.querySelector('.row-menu[open]');
+  const openTaskId = openMenu?.closest('.task-row')?.dataset.taskId || '';
   const tasks = queue.tasks || [];
   const active = tasks.filter((task) => ['queued', 'downloading'].includes(task.status));
+  const doneCount = tasks.filter((task) => task.status === 'done').length;
   elements.queueSummary.textContent = tasks.length
-    ? `进行中 ${active.length} · 并发上限 ${queue.limit} · 共 ${tasks.length} 条`
+    ? `进行中 ${active.length} · 未完成 ${tasks.length - doneCount} · 共 ${tasks.length} 条`
     : '没有任务';
-  elements.taskEmpty.classList.toggle('hidden', tasks.length > 0);
+
+  const visibleTasks = tasks.filter((task) => {
+    if (queueFilter === 'active') return task.status !== 'done';
+    if (queueFilter === 'done') return task.status === 'done';
+    return true;
+  });
+
+  elements.taskEmpty.classList.toggle('hidden', visibleTasks.length > 0);
+  elements.taskEmpty.textContent = tasks.length
+    ? (queueFilter === 'done' ? '还没有已完成的任务。' : '没有未完成的任务。')
+    : '队列是空的，解析一条链接后加入下载。';
   elements.taskList.replaceChildren();
 
-  for (const task of [...tasks].reverse()) {
+  for (const task of [...visibleTasks].reverse()) {
     const item = document.createElement('li');
     item.className = `task-row status-${task.status}`;
+    item.dataset.taskId = task.id;
+
+    const thumb = document.createElement('div');
+    thumb.className = 'task-thumb';
+    thumb.append(iconNode(STATUS_ICONS[task.status] || 'download'));
+
+    const main = document.createElement('div');
+    main.className = 'task-main';
 
     const head = document.createElement('div');
     head.className = 'task-head';
     head.append(make(task.title, 'strong'));
     const retryText = task.retrying ? ' · 等重试倒计时' : task.attempts > 1 ? ` · 第 ${task.attempts} 次尝试` : '';
     head.append(make(`${STATUS_LABELS[task.status] || task.status}${task.used_engine ? ` · ${task.used_engine}` : ''}${retryText}`, 'span'));
-    item.append(head);
+    main.append(head);
 
     const meta = document.createElement('p');
     meta.className = 'task-meta';
     const pieces = [
       safeHost(task.url) || '链接',
-      task.mode,
+      MODE_LABELS[task.mode] || task.mode,
       task.file_count ? `${task.file_count} 个文件` : '',
       task.size_text && task.bytes ? task.size_text : '',
       task.progress?.percent ? `${task.progress.percent}` : '',
@@ -867,7 +963,7 @@ function renderQueue(snapshot) {
       task.progress?.eta || '',
     ].filter(Boolean);
     meta.textContent = pieces.join(' · ');
-    item.append(meta);
+    main.append(meta);
 
     const percent = Number.parseFloat(task.progress?.percent) || (task.status === 'done' ? 100 : 0);
     const track = document.createElement('div');
@@ -875,71 +971,131 @@ function renderQueue(snapshot) {
     const bar = document.createElement('div');
     bar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
     track.append(bar);
-    if (task.status === 'downloading' || task.status === 'done') item.append(track);
+    if (task.status === 'downloading' || task.status === 'done') main.append(track);
 
     if (task.error) {
       const error = document.createElement('p');
       error.className = 'task-error';
-      error.textContent = `${task.error}${task.kind ? `（${kindLabel(task.kind)}）` : ''}`;
-      item.append(error);
-      for (const remedy of (task.remedies || []).slice(0, 4)) {
-        const button = makeButton(REMEDY_LABELS[remedy.action] || remedy.label, 'remedy-button', () => {
-          if (remedy.action === 'login' || remedy.action === 'open_site') {
-            elements.url.value = task.url || '';
-            updateContextChips();
-          }
-          if (remedy.action === 'retry') {
-            void window.qingying.retryTask(task.id);
-            return;
-          }
-          runRemedy(remedy, null);
-        });
-        item.append(button);
-        if (remedy.detail) item.append(make(remedy.detail, 'task-remedy-detail'));
+      const kind = task.kind ? kindLabel(task.kind) : '';
+      error.textContent = kind && !task.error.includes(kind) ? `${task.error}（${kind}）` : task.error;
+      main.append(error);
+      if ((task.remedies || []).length) {
+        const remedies = document.createElement('div');
+        remedies.className = 'task-remedies';
+        for (const remedy of (task.remedies || []).slice(0, 4)) {
+          const button = makeButton(REMEDY_LABELS[remedy.action] || remedy.label, 'remedy-button', () => {
+            if (remedy.action === 'login' || remedy.action === 'open_site') {
+              elements.url.value = task.url || '';
+              updateContextChips();
+            }
+            if (remedy.action === 'retry') {
+              void window.qingying.retryTask(task.id);
+              return;
+            }
+            runRemedy(remedy, null);
+          });
+          if (remedy.detail) button.title = remedy.detail;
+          remedies.append(button);
+        }
+        main.append(remedies);
       }
     }
 
-    if (task.status === 'paused' || task.status === 'cancelled') {
+    if (task.status === 'paused') {
       const hint = document.createElement('p');
-      hint.className = 'task-meta';
-      hint.textContent = '已下载的分片保留在目标目录里（.part / .ytdl），点"重试/继续"会接着下，不会从头重来。';
-      item.append(hint);
+      hint.className = 'task-note';
+      hint.textContent = '未完成的分片（.part）还在目标目录里，点"继续"会接着下。';
+      main.append(hint);
     }
 
+    const controls = document.createElement('div');
+    controls.className = 'task-controls';
+
+    let primary = null;
+    if (task.status === 'downloading' || task.status === 'queued') {
+      primary = { icon: 'pause', label: '暂停', run: () => window.qingying.pauseTask(task.id) };
+    } else if (task.status === 'paused') {
+      primary = { icon: 'play', label: '继续', run: () => window.qingying.resumeTask(task.id) };
+    } else if (task.status === 'failed' || task.status === 'cancelled') {
+      primary = { icon: 'retry', label: '重试', run: () => window.qingying.retryTask(task.id) };
+    } else if (task.status === 'done' && task.output_dir) {
+      primary = { icon: 'folder', label: '打开目录', run: () => window.qingying.openFolder(task.output_dir) };
+    }
+    if (primary) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'icon-button accent';
+      button.title = primary.label;
+      button.setAttribute('aria-label', primary.label);
+      button.append(iconNode(primary.icon));
+      button.addEventListener('click', primary.run);
+      controls.append(button);
+    }
+
+    const menu = document.createElement('details');
+    menu.className = 'row-menu';
+    const summary = document.createElement('summary');
+    summary.className = 'icon-button';
+    summary.title = '更多操作';
+    summary.setAttribute('aria-label', '更多操作');
+    summary.append(iconNode('dots'));
+    const panel = document.createElement('div');
+    panel.className = 'menu-panel';
+    const addMenuItem = (text, icon, run) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'menu-item';
+      button.append(iconNode(icon));
+      button.append(make(text));
+      button.addEventListener('click', () => {
+        menu.open = false;
+        run();
+      });
+      panel.append(button);
+    };
+    if (task.output_dir && task.status !== 'done') {
+      addMenuItem('打开目录', 'folder', () => window.qingying.openFolder(task.output_dir));
+    }
+    if (['downloading', 'queued', 'paused'].includes(task.status)) {
+      addMenuItem('取消任务', 'close', () => window.qingying.cancelTask(task.id));
+    }
+    if (task.status === 'done' && task.file_count) {
+      addMenuItem('删除记录', 'trash', () => window.qingying.removeTask(task.id));
+    }
     if (task.status === 'done' && task.files?.length) {
-      const list = document.createElement('div');
-      list.className = 'task-files';
+      const files = document.createElement('div');
+      files.className = 'menu-files';
       for (const file of task.files.slice(0, 3)) {
         const name = String(file.path).split(/[\\/]/).pop();
         const size = file.size || humanBytes(file.bytes);
-        const button = makeButton(`${name}${size ? ` (${size})` : ''}`, 'mini-button ghost', () => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'menu-item';
+        button.title = file.path;
+        button.append(iconNode('file'));
+        button.append(make(`${name}${size ? ` (${size})` : ''}`));
+        button.addEventListener('click', () => {
+          menu.open = false;
           void window.qingying.revealFile(file.path);
         });
-        button.title = file.path;
-        list.append(button);
+        files.append(button);
       }
-      if (task.file_count > 3) list.append(make(`还有 ${task.file_count - 3} 个文件`, 'small'));
-      item.append(list);
+      if (task.file_count > 3) files.append(make(`还有 ${task.file_count - 3} 个文件`, 'menu-empty'));
+      panel.append(files);
+    }
+    if (panel.children.length) {
+      menu.append(summary, panel);
+      controls.append(menu);
     }
 
-    const actions = document.createElement('div');
-    actions.className = 'task-actions';
-    if (task.status === 'downloading' || task.status === 'queued') {
-      actions.append(makeButton('暂停', 'mini-button', () => window.qingying.pauseTask(task.id)));
-      actions.append(makeButton('取消', 'mini-button ghost', () => window.qingying.cancelTask(task.id)));
-    } else if (task.status === 'paused') {
-      actions.append(makeButton('继续', 'mini-button', () => window.qingying.resumeTask(task.id)));
-    } else if (task.status === 'failed' || task.status === 'cancelled') {
-      actions.append(makeButton('重试', 'mini-button', () => window.qingying.retryTask(task.id)));
-    }
-    if (task.output_dir) {
-      actions.append(makeButton('打开目录', 'mini-button ghost', () => window.qingying.openFolder(task.output_dir)));
-    }
-    if (task.status === 'done' && task.file_count) {
-      actions.append(makeButton('删除记录', 'mini-button ghost', () => window.qingying.removeTask(task.id)));
-    }
-    item.append(actions);
+    item.append(thumb, main, controls);
     elements.taskList.append(item);
+  }
+
+  if (openTaskId) {
+    const row = [...elements.taskList.querySelectorAll('.task-row')].find((node) => node.dataset.taskId === openTaskId);
+    const menu = row?.querySelector('.row-menu');
+    if (menu) menu.open = true;
   }
 
   // 有任务进入终态就去清点一次残留分片（不在每次进度回调里扫盘）。
@@ -989,6 +1145,13 @@ const STATUS_LABELS = {
 };
 
 // ── 历史 ──────────────────────────────────────────────────────────────────
+function redoHistory(item) {
+  elements.url.value = item.url || '';
+  switchView('home');
+  hideMediaResult();
+  void analyze();
+}
+
 function renderHistory(items) {
   if (items) history = items;
   const list = history || [];
@@ -1004,9 +1167,15 @@ function renderHistory(items) {
   for (const item of list.slice(0, HISTORY_RENDER_LIMIT)) {
     const row = document.createElement('li');
     row.className = `history-row status-${item.status}`;
+
+    const thumb = document.createElement('div');
+    thumb.className = 'history-thumb';
+    thumb.append(iconNode(item.status === 'done' ? 'check' : (item.status === 'failed' ? 'alert' : 'clock')));
+
     const body = document.createElement('div');
+    body.className = 'history-main';
     body.append(make(item.title || safeHost(item.url) || '未命名', 'strong'));
-    const detail = document.createElement('small');
+    const detail = document.createElement('span');
     const bytesText = item.bytes ? humanBytes(item.bytes) : '';
     detail.textContent = [
       STATUS_LABELS[item.status] || item.status,
@@ -1017,21 +1186,50 @@ function renderHistory(items) {
       item.error ? `失败：${item.error}` : '',
     ].filter(Boolean).join(' · ');
     body.append(detail);
-    row.append(body);
 
-    const actions = document.createElement('div');
-    actions.className = 'task-actions';
-    if (item.output_dir) actions.append(makeButton('打开目录', 'mini-button ghost', () => window.qingying.openFolder(item.output_dir)));
-    actions.append(makeButton('复制链接', 'mini-button ghost', () => {
+    const controls = document.createElement('div');
+    controls.className = 'task-controls';
+
+    const again = document.createElement('button');
+    again.type = 'button';
+    again.className = 'icon-button accent';
+    again.title = '再下一次';
+    again.setAttribute('aria-label', '再下一次');
+    again.append(iconNode('retry'));
+    again.addEventListener('click', () => redoHistory(item));
+    controls.append(again);
+
+    const menu = document.createElement('details');
+    menu.className = 'row-menu';
+    const summary = document.createElement('summary');
+    summary.className = 'icon-button';
+    summary.title = '更多操作';
+    summary.setAttribute('aria-label', '更多操作');
+    summary.append(iconNode('dots'));
+    const panel = document.createElement('div');
+    panel.className = 'menu-panel';
+    const addMenuItem = (text, icon, run) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'menu-item';
+      button.append(iconNode(icon));
+      button.append(make(text));
+      button.addEventListener('click', () => {
+        menu.open = false;
+        run();
+      });
+      panel.append(button);
+    };
+    if (item.output_dir) addMenuItem('打开目录', 'folder', () => window.qingying.openFolder(item.output_dir));
+    addMenuItem('复制链接', 'copy', () => {
       void window.qingying.writeClipboard(item.url || '');
       setStatus('链接已复制。', 'success');
-    }));
-    actions.append(makeButton('再下一次', 'mini-button', () => {
-      elements.url.value = item.url || '';
-      hideMediaResult();
-      void analyze();
-    }));
-    row.append(actions);
+    });
+    addMenuItem('再下一次', 'retry', () => redoHistory(item));
+    menu.append(summary, panel);
+    controls.append(menu);
+
+    row.append(thumb, body, controls);
     elements.historyList.append(row);
   }
 }
@@ -1060,7 +1258,6 @@ function renderApiStatus(state) {
       elements.apiStatusNote.textContent = `本机接口：没有起来。${state.error || '主进程没有给出原因'}`
         + ' 换端口：设环境变量 QINGYING_API_PORT 后重启软件。接口不可用不影响界面里的下载。';
     }
-    setStatus(`本机接口没有起来：${state.error || '端口可能被别的程序占用'}`, 'error');
     return;
   }
   if (elements.apiStatusNote) {
@@ -1080,6 +1277,7 @@ function applySettings(next) {
   elements.settingConcurrency.value = String(next.concurrency ?? 2);
   elements.settingRetry.value = String(next.autoRetry ?? 2);
   elements.settingEngine.value = next.enginePreference || 'auto';
+  if (document.activeElement !== elements.settingProxy) elements.settingProxy.value = next.proxy || '';
   elements.settingSubfolder.checked = Boolean(next.subfolderByPost);
   elements.settingExportCookies.checked = Boolean(next.exportCookiesForCli);
   elements.templateError.classList.toggle('hidden', !next.filename_template_error);
@@ -1189,7 +1387,31 @@ async function runBatch() {
   }
   await window.qingying.submitQueue(items);
   setWorkflow(3);
+  setQueueFilter('all');
+  switchView('queue');
   setStatus(`已加入 ${items.length} 个任务${failed ? `，${failed} 条解析失败被跳过` : ''}。`, 'success');
+}
+
+// 平台快捷入口：切到输入框，剪贴板里正好是该站点的链接就顺手填上。
+async function quickSite(siteId) {
+  const site = siteCatalog.find((item) => item.id === siteId);
+  const label = site?.label || QUICK_SITE_LABELS[siteId] || siteId;
+  elements.url.focus();
+  elements.url.placeholder = `粘贴 ${label} 链接后按回车`;
+  setStatus(`已选择 ${label}，粘贴链接后按回车解析。`);
+  if (!site) return;
+  try {
+    const text = (await window.qingying.readClipboard()).trim();
+    if (!/^https?:\/\//i.test(text)) return;
+    if (siteOf(text)?.id !== site.id) return;
+    elements.url.value = text;
+    hideMediaResult();
+    updateContextChips();
+    setEmptyState('idle', `已填入 ${label} 链接`, '按回车或点“解析”开始。');
+    setStatus('已从剪贴板填入链接。', 'success');
+  } catch {
+    // 剪贴板不可读时保持手动粘贴。
+  }
 }
 
 // ── 事件接线 ──────────────────────────────────────────────────────────────
@@ -1238,8 +1460,37 @@ elements.contextLogin.addEventListener('click', () => openLogin(contextSiteId));
 elements.batchToggle.addEventListener('click', () => {
   const open = elements.batchPanel.classList.toggle('hidden') === false;
   elements.batchToggle.setAttribute('aria-expanded', String(open));
-  elements.batchToggle.textContent = open ? '收起批量输入' : '批量粘贴多条链接';
+  const label = elements.batchToggle.querySelector('#batch-toggle-label');
+  if (label) label.textContent = open ? '收起批量输入' : '批量粘贴多条链接';
+  else elements.batchToggle.textContent = open ? '收起批量输入' : '批量粘贴多条链接';
   if (open) elements.batchUrls.focus();
+});
+
+for (const button of railButtons) {
+  button.addEventListener('click', () => switchView(button.dataset.view));
+}
+for (const button of filterButtons) {
+  button.addEventListener('click', () => setQueueFilter(button.dataset.queueFilter));
+}
+for (const button of document.querySelectorAll('[data-quick-site]')) {
+  button.addEventListener('click', () => void quickSite(button.dataset.quickSite));
+}
+
+document.querySelector('#new-task')?.addEventListener('click', () => {
+  switchView('home');
+  elements.url.focus();
+  elements.url.select();
+});
+document.querySelector('#queue-open-folder')?.addEventListener('click', async () => {
+  const folder = elements.folder.value.trim();
+  if (!folder) return setStatus('还没有选择下载目录。', 'error');
+  const opened = await window.qingying.openFolder(folder);
+  if (!opened) setStatus('下载目录不存在或无法打开。', 'error');
+});
+document.addEventListener('click', (event) => {
+  for (const menu of document.querySelectorAll('.row-menu[open]')) {
+    if (!menu.contains(event.target)) menu.open = false;
+  }
 });
 elements.batchUrls.addEventListener('input', readBatchUrls);
 elements.batchRun.addEventListener('click', () => void runBatch());
@@ -1305,6 +1556,7 @@ elements.settingExportCookies.addEventListener('change', async () => {
 elements.settingConcurrency.addEventListener('change', () => saveSettings({ concurrency: Number(elements.settingConcurrency.value) }));
 elements.settingRetry.addEventListener('change', () => saveSettings({ autoRetry: Number(elements.settingRetry.value) }));
 elements.settingEngine.addEventListener('change', () => saveSettings({ enginePreference: elements.settingEngine.value }));
+elements.settingProxy.addEventListener('change', () => saveSettings({ proxy: elements.settingProxy.value.trim() }));
 
 elements.openFolder.addEventListener('click', async () => {
   const opened = await window.qingying.openFolder(elements.folder.value.trim());
@@ -1393,9 +1645,14 @@ renderAuth();
 
 async function bootstrap() {
   try {
+    // 设置一拿到就应用，不必等引擎探测结束才把下载目录显示出来。
+    const settingsPromise = window.qingying.settingsGet().then((result) => {
+      applySettings(result);
+      return result;
+    });
     const [info, settingsResult, queueResult, historyResult, enginesResult, sites, apiRecord] = await Promise.all([
       window.qingying.getAppInfo(),
-      window.qingying.settingsGet(),
+      settingsPromise,
       window.qingying.listQueue(),
       window.qingying.historyList(),
       window.qingying.enginesProbe(),
@@ -1438,7 +1695,7 @@ if (winControls) {
   document.getElementById('win-close')?.addEventListener('click', () => void winControls.close());
   winControls.isMaximized().then(setMax).catch(() => {});
   winControls.onMaximizedChange?.(setMax);
-  for (const region of document.querySelectorAll('.brand, .workspace-header')) {
+  for (const region of document.querySelectorAll('.brand, .titlebar')) {
     region.addEventListener('dblclick', (event) => {
       if (event.target instanceof Element && event.target.closest('button, a, input, select')) return;
       void winControls.toggleMaximize();

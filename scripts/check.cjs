@@ -85,7 +85,7 @@ report('agent server default port 8793', /PROJECT_DEFAULT_PORT = 8793/.test(serv
 const localGuardSrc = fs.readFileSync(path.join(ROOT, 'electron', 'local-guard.cjs'), 'utf8');
 const agentApiSrc = fs.readFileSync(path.join(ROOT, 'electron', 'agent-api.cjs'), 'utf8');
 report('guard module exists and is required by both api surfaces',
-  /require\('\.\/local-guard\.cjs'\)/.test(agentApiSrc) && /'..', 'electron', 'local-guard\.cjs'/.test(serverSrc),
+  /require\('\.\/local-guard\.cjs'\)/.test(agentApiSrc) && /require\('\.\.\/electron\/local-guard\.cjs'\)/.test(serverSrc),
   '');
 report('guard checks Host before any business route',
   /checkLocalGuard\(req/.test(agentApiSrc) && /replyGuardDenied/.test(agentApiSrc)

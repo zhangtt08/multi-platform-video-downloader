@@ -54,9 +54,14 @@ function engineOptions(dir) {
   const roots = [];
   const envDir = core.safeText(process.env.QINGYING_ENGINE_DIR, 1024).trim();
   if (envDir) roots.push(envDir);
+  // 与桌面壳同一套解析顺序（electron/main.cjs 的 engineOptions）：
+  // 用户设置 → 应用目录下的 resources/bin → resources；打包版的工具就放在 resources/bin。
   if (settings.enginesDir) roots.push(settings.enginesDir);
   roots.push(path.join(ROOT, 'resources', 'bin'));
   roots.push(path.join(ROOT, 'resources'));
+  // 打包版 exe 旁边的 resources/bin（agent 目录与 app.asar 同级时 app.getAppPath 不适用，这里按路径推）。
+  roots.push(path.join(ROOT, '..', 'resources', 'bin'));
+  if (process.resourcesPath) roots.push(path.join(process.resourcesPath, 'bin'));
   return { overrides: {}, extraRoots: roots };
 }
 

@@ -5,12 +5,18 @@
 // 项目在 tools.mjs 里 export const project = { id, name, version, summary, port? } 即可：
 // 令牌请求头按 x-<id>-token 自动推导（id 缺省 'agent'），默认端口按 project.port（缺省 8790）。
 import { createServer } from 'node:http';
-import { writeFileSync, existsSync } from 'node:fs';
+import { writeFileSync, existsSync, readFileSync } from 'node:fs';
+const fs = { readFileSync };
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { assertLoopbackBindHost, checkLocalGuard, describeBindError, localHeaders, replyGuardDenied } from './local-guard.mjs';
+import { createRequire } from 'node:module';
 import { ensureAgentToken } from './token-store.mjs';
 
+const require = createRequire(import.meta.url);
+// 守卫判据只有一份：electron/local-guard.cjs（Electron 主进程的 8392 接口用的也是它）。
+const guard = require('../electron/local-guard.cjs');
+// 本机统一注册表里清影占 8793（README / launch.json / scripts/check.cjs 都以它为准）。
+export const PROJECT_DEFAULT_PORT = 8793;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const START = Date.now();
 
@@ -29,7 +35,7 @@ function loadTools() {
 
 function json(res, status, body, extra = {}) {
   const buf = Buffer.from(JSON.stringify(body));
-  res.writeHead(status, localHeaders({
+  res.writeHead(status, guard.localHeaders({
     'content-type': 'application/json; charset=utf-8',
     'content-length': buf.length,
     ...extra,
@@ -68,15 +74,18 @@ function validate(schema, input) {
 }
 
 export async function start({ port: wantPort, host = '127.0.0.1', label = 'agent' } = {}) {
-  // 标准第 1 条：绑非回环直接拒绝启动，不是提醒一句
-  const bind = assertLoopbackBindHost(host);
-  if (!bind.ok) throw new Error(bind.error);
+  // 标准第 1 条：绑非回环直接拒绝启动，不是提醒一句（判据在 local-guard 里，只有一份）。
+  // 标准第 1 条：绑非回环直接拒绝启动（判据与绑定入口都走 electron/local-guard.cjs，只有一份）。
+  // 非回环地址由 listenLocal 返回 ok:false 并拒绝，这里不用第二套规则重复判断。
   const mod = await loadTools();
   const meta = mod.project || { name: label, version: '0.0.0' };
-  const projectId = String(mod.projectId || meta.id || label);
+  const projectId = String(mod.projectId || meta.id || 'qingying');
   const tokenHeader = `x-${projectId}-token`;
   // 令牌在服务起来之前就取定：拿不到就抛，绝不以"写接口没有守卫"的状态监听
-  const secret = ensureAgentToken(projectId);
+  const secret = ensureAgentToken(projectId);  // { token, file, source }
+  // source 取值：env（环境变量给定）/ file（复用已有）/ created（本次生成）。
+  // 绑定/守卫/响应头全部走 local-guard：与 8392 那份是同一套判据。
+  const tokenInfo = secret;
   const tools = mod.tools || [];
   const byName = new Map(tools.map((t) => [t.name, t]));
   const descriptor = (t) => ({ name: t.name, description: t.description, input_schema: t.input_schema, risk: t.risk || 'read' });
@@ -85,8 +94,8 @@ export async function start({ port: wantPort, host = '127.0.0.1', label = 'agent
     const addr = server.address();
     const port = typeof addr === 'object' && addr ? addr.port : Number(wantPort) || 8790;
     // 守卫在最前：Host / Origin / Referer / 令牌，任何一条不过都不进业务分支
-    const verdict = checkLocalGuard(req, { port, token: secret.token, tokenHeader });
-    if (!verdict.ok) { replyGuardDenied(res, verdict, tokenHeader); return; }
+    const verdict = guard.checkLocalGuard(req, { port, token: tokenInfo.token, tokenHeader });
+    if (!verdict.ok) { guard.replyGuardDenied(res, verdict); return; }
     const url = new URL(req.url, `http://${req.headers.host || host}`);
     const route = url.pathname.replace(/\/+$/, '') || '/';
     try {
@@ -98,7 +107,11 @@ export async function start({ port: wantPort, host = '127.0.0.1', label = 'agent
         return;
       }
       if (route === '/api/health') {
-        json(res, 200, { ok: true, data: { project: meta.name, version: meta.version, agent_api: 1, tools: tools.length, uptime_ms: Date.now() - START, guard: { host: `127.0.0.1:${port} / localhost:${port} / [::1]:${port}`, origin: 'loopback only', token_required_for: '非 GET/HEAD', token_file: secret.file ?? 'env', wildcard_cors: false } } });
+        // 如实回执本服务自己的守卫：令牌来源、监听地址白名单、桌面 8392 接口的真实状态。
+        const statusFile = path.join(path.dirname(tokenInfo.file || ''), 'agent-api-status.json');
+        let desktopApi = { listening: false, note: '桌面界面没有运行（无 agent-api-status.json）' };
+        try { desktopApi = { ...JSON.parse(fs.readFileSync(statusFile, 'utf8')), status_file: statusFile }; } catch { /* 桌面没开就如实说没开 */ }
+        json(res, 200, { ok: true, data: { project: meta.name, version: meta.version, agent_api: 1, tools: tools.length, uptime_ms: Date.now() - START, token_required: true, token_header: tokenHeader, token_file: tokenInfo.file ?? null, desktop_api: desktopApi, guard: { host: `127.0.0.1:${port} / localhost:${port} / [::1]:${port}`, host_allowlist: `127.0.0.1:${port} / localhost:${port} / [::1]:${port}`, origin: 'loopback only', token_required: true, token_required_for: '非 GET/HEAD', token_available: true, token_source: tokenInfo.source || 'file', token_file: tokenInfo.file ?? 'env', wildcard_cors: false, token_required_for: '非 GET/HEAD' } } });
       } else if (route === '/api/agent/tools') {
         json(res, 200, { ok: true, data: tools.map(descriptor) });
       } else if (route === '/api/agent/manifest') {
@@ -116,7 +129,9 @@ export async function start({ port: wantPort, host = '127.0.0.1', label = 'agent
           json(res, 200, { ok: true, tool: tool.name, ms: Date.now() - t0, data });
         } catch (e) {
           const code = e instanceof AgentError ? e.code : 'handler_failed';
-          json(res, e instanceof AgentError && e.code === 'bad_input' ? 400 : 500, { ok: false, tool: tool.name, error: { code, message: e.message } });
+          // 调用方修得了的（参数不存在/越界/缺确认/令牌之类）一律 400，只有真正的内部异常才是 500。
+          const callerFixable = e instanceof AgentError && ['bad_input', 'unknown_tool', 'not_found', 'output_dir_outside_root', 'output_dir_not_absolute', 'output_dir_refused', 'no_download_root', 'confirm_required'].includes(e.code);
+          json(res, callerFixable ? 400 : 500, { ok: false, tool: tool.name, error: { code, message: e.message } });
         }
       } else {
         json(res, 404, { ok: false, error: { code: 'not_found', message: `未知路径 ${route}`, endpoints: ['/api/health', '/api/agent/tools', '/api/agent/manifest', 'POST /api/agent/tool'] } });
@@ -131,16 +146,19 @@ export async function start({ port: wantPort, host = '127.0.0.1', label = 'agent
   });
 
   const endpointFile = path.join(__dirname, '.endpoint');
-  const listen = (p, tries) => new Promise((resolve, reject) => {
-    server.once('error', (e) => {
-      if (e.code === 'EADDRINUSE' && tries > 0) resolve(listen(p + 1, tries - 1));
-      // 绑定失败要说得出原因与下一步，不许留一个"看起来起来了"的空进程
-      else reject(new Error(describeBindError(e, p)));
-    });
-    server.listen(p, host, () => resolve(server.address().port));
-  });
-
-  const port = await listen(Number(wantPort) || Number(process.env.AGENT_PORT || process.env.PORT) || Number(meta.port) || 8790, 12);
+  // 绑定：走 local-guard 的 listenLocal（只准回环 + 失败说出原因）；端口被占按契约 +1，最多试 12 个。
+  let outcome = null;
+  // 显式传入 port（含 0 = 系统分配临时端口）时，严格按它执行，不往上换端口：
+  // 否则调用方按自己给的端口去连，会永远连不上（自检/test 都踩过这个坑）。
+  const explicitPort = wantPort !== undefined && wantPort !== null && wantPort !== '' && Number.isFinite(Number(wantPort));
+  for (let p = explicitPort ? Number(wantPort) : (Number(process.env.AGENT_PORT || process.env.PORT) || Number(meta.port) || PROJECT_DEFAULT_PORT), tries = explicitPort ? 0 : 12; tries >= 0; p += 1, tries -= 1) {
+    outcome = await guard.listenLocal(server, p, { host, token: tokenInfo.token });
+    if (outcome.ok) break;
+    // 只有"端口被占"才往上换；非回环、权限这类绑定错误直接如实抛，不换端口蒙混过去。
+    if (!/已被别的程序占用/.test(outcome.error || '')) throw new Error(outcome.error);
+  }
+  if (!outcome || !outcome.ok) throw new Error((outcome && outcome.error) || '接口未能监听');
+  const port = outcome.port;
   writeFileSync(endpointFile, `http://${host}:${port}\n`);
   console.log(`[agent] ${meta.name} v${meta.version} → http://${host}:${port} (${tools.length} tools)`);
   console.log(`[agent] 本机守卫：Host 只认 127.0.0.1/localhost/[::1]:${port}，非 GET 需 ${tokenHeader}${secret.file ? `（令牌文件 ${secret.file}，0600）` : '（令牌来自环境变量）'}`);

@@ -20,15 +20,19 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 
-const TOKEN_FILE_NAME = 'agent-api.token';
+const TOKEN_FILE_NAME = 'agent-api.token';  // 与 electron/engine-core.cjs 的 dataPaths().apiToken 同名
 const MIN_TOKEN_LENGTH = 32;
 
 /** 项目的每用户数据目录（唯一一份判据；server 与 MCP 桥必须传同一个 projectId） */
 export function appDataDir(projectId, env = process.env) {
   const override = String(env.AGENT_API_DATA_DIR ?? '').trim();
   if (override) return override;
+  // 项目自己的数据目录（与桌面壳 electron/main.cjs 的 DATA_DIR 同一处）：
+  // 界面生成的令牌、独立服务、MCP 桥三边必须读到同一枚，否则写请求永远 401。
+  const projectData = String(env.QINGYING_DATA_DIR ?? '').trim();
+  if (projectData) return projectData;
   const appData = String(env.APPDATA ?? env.AppData ?? '').trim();
-  if (appData) return path.join(appData, projectId);
+  if (appData) return path.join(appData, 'qingying-downloader', 'qingying');
   return path.join(os.homedir(), '.agent-api', projectId);
 }
 
@@ -73,9 +77,8 @@ function createOrAdopt(file, candidate) {
 
 /** 只读：MCP 桥与自检用它，绝不在这里造令牌（造是服务端启动那一次的事） */
 export function readAgentToken(projectId, env = process.env) {
-  const fromEnv = String(env.AGENT_API_TOKEN ?? '').trim();
-  if (fromEnv) return fromEnv;
-  return readFileToken(agentTokenFile(projectId, env));
+  // QINGYING_API_TOKEN 是项目对外公开名（README/桌面壳），AGENT_API_TOKEN 是标准模板名；两者同权。
+  const fromEnv = String(env.QINGYING_API_TOKEN ?? env.AGENT_API_TOKEN ?? '').trim();
 }
 
 /**
@@ -83,11 +86,11 @@ export function readAgentToken(projectId, env = process.env) {
  * 拿不到就抛 —— 服务宁可不起，也不能"没有令牌"地把写接口开放出去。
  */
 export function ensureAgentToken(projectId, env = process.env) {
-  const fromEnv = String(env.AGENT_API_TOKEN ?? '').trim();
+  // 与 read 同一判据：两个变量名都认（QINGYING_API_TOKEN 优先）。
+  const fromEnv = String(env.QINGYING_API_TOKEN ?? env.AGENT_API_TOKEN ?? '').trim();
   if (fromEnv) return { token: fromEnv, file: null, source: 'env' };
   const file = agentTokenFile(projectId, env);
   const existing = readFileToken(file);
-  if (existing) return { token: existing, file, source: 'file' };
   const secret = crypto.randomBytes(32).toString('hex');
   try {
     const outcome = createOrAdopt(file, secret);

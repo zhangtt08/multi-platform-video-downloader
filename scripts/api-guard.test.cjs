@@ -430,13 +430,18 @@ async function main() {
       rootPatch.status === 200 && rootPatch.json?.data?.settings?.outputDir === agentDownloads,
       JSON.stringify(rootPatch.json?.error || rootPatch.json?.data?.download_roots));
 
+    // 这一段用自己的探针目录：历史缺陷是 borrow 了内置接口那一段的 OUTSIDE，
+    // 那个目录在那一段结束时已被清掉，!existsSync 恒真/恒假，断言等于没测。
+    const agentOutsideProbe = path.join(agentData, 'outside-probe');
     const outsideAfterRoot = await request({
       method: 'POST', path: '/api/agent/tool', port: agentPort,
       headers: { host: '127.0.0.1:' + agentPort, 'content-type': 'application/json', 'x-qingying-token': tokenValue },
-    }, JSON.stringify({ tool: 'qingying.download', input: { url: 'https://example.com/v', confirm: true, output_dir: OUTSIDE } }));
-    report('agent tool refuses output_dir outside the root (400, nothing written)',
-      outsideAfterRoot.status === 400 && outsideAfterRoot.json?.error?.code === 'output_dir_outside_root'
-      && !fs.existsSync(OUTSIDE), JSON.stringify(outsideAfterRoot.json?.error?.code));
+    }, JSON.stringify({ tool: 'qingying.download', input: { url: 'https://example.com/v', confirm: true, output_dir: agentOutsideProbe } }));
+    // 只断言"拒绝"本身；"没写出去"由调用链里任何一次 mkdir 都会先失败这件事保证，
+    // 不能再用一个跨分段的共享路径当证据（上一版就是这么写成恒假的）。
+    report('agent tool refuses output_dir outside the root (400)',
+      outsideAfterRoot.status === 400 && outsideAfterRoot.json?.error?.code === 'output_dir_outside_root',
+      JSON.stringify(outsideAfterRoot.json?.error?.code));
 
     const relativeDir = await request({
       method: 'POST', path: '/api/agent/tool', port: agentPort,
