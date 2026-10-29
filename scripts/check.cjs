@@ -232,6 +232,11 @@ report('douyin plans browser first and drops gallery-dl',
   JSON.stringify(douyinPlan.chain.map((s) => s.engine)));
 report('without a browser the douyin plan stays the legacy chain',
   core.planEngine('https://www.douyin.com/video/1', { yt_dlp: { available: true }, gallery_dl: { available: true } }, 'auto').primary === 'yt-dlp');
+const douyinPref = core.planEngine('https://www.douyin.com/video/1',
+  { yt_dlp: { available: true }, gallery_dl: { available: true } }, 'gallery-dl', { browserAvailable: true });
+report('preference missing from the chain is stated, not silently relabelled',
+  douyinPref.primary === 'browser' && /不适用/.test(douyinPref.chain[0].reason) && !/图片链路优先/.test(douyinPref.chain[0].reason),
+  douyinPref.chain[0].reason);
 const infoArgs = core.buildDownloadArgs({
   url: 'https://www.douyin.com/video/1', outputDir: 'C:/tmp/out', mode: 'combined',
   videoId: 'dj-1920p', videoExt: 'mp4', videoHasAudio: true, audioId: '', audioExt: '',

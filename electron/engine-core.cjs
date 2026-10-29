@@ -999,7 +999,9 @@ function planEngine(url, engines, preference, options) {
     available: has(step.engine),
   }));
 
-  if (wanted) {
+  // 偏好只在链上真有这个引擎时才改写理由；抖音链里没有 gallery-dl，硬套一句
+  // "设置里指定了 gallery-dl" 会让界面把"被忽略的设置"说成"正在用的引擎"。
+  if (wanted && chain.some((step) => step.engine === wanted)) {
     const chosen = chain.filter((step) => step.engine === wanted).concat(chain.filter((step) => step.engine !== wanted));
     const label = wanted === 'gallery-dl' ? '图片链路' : '视频链路';
     chosen.forEach((step, index) => {
@@ -1008,6 +1010,8 @@ function planEngine(url, engines, preference, options) {
         : '指定引擎没有可用结果时自动改用另一个引擎';
     });
     chain = chosen;
+  } else if (wanted) {
+    chain[0].reason += '；设置里指定的 ' + wanted + ' 对这类链接不适用，这一条不会用它';
   }
   chain.forEach((step, index) => { step.role = index === 0 ? 'primary' : 'fallback'; });
 
