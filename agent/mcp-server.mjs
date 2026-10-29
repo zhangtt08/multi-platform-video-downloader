@@ -9,7 +9,8 @@ import path from 'node:path';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
-const PROTOCOL = '2.2.0';
+const PROTOCOL = '2025-06-18';
+const PROTOCOLS = ['2024-11-05', '2025-03-26', '2025-06-18'];
 const SERVER_INFO = { name: path.basename(PROJECT_ROOT) + '-agent-api', version: '1.0.0' };
 
 const log = (...a) => process.stderr.write(`[mcp] ${a.join(' ')}\n`);
@@ -70,7 +71,8 @@ async function rpc(base, method, params) {
     method: method === 'tools/list' ? 'GET' : 'POST',
     headers,
     body: method === 'tools/list' ? undefined : JSON.stringify(params),
-    signal: AbortSignal.timeout(120_000),
+    // 下载本身可能跑很久，桥不能比服务端先放弃
+    signal: AbortSignal.timeout(method === 'tools/list' ? 60_000 : 1_800_000),
   });
   let body = await res.json().catch(() => ({}));
   // 服务刚换过令牌（app-data 里的文件被重建）就重取一次再试，只试一次。
@@ -83,7 +85,7 @@ async function rpc(base, method, params) {
         method: 'POST',
         headers,
         body: JSON.stringify(params),
-        signal: AbortSignal.timeout(120_000),
+        signal: AbortSignal.timeout(1_800_000),
       });
       body = await res.json().catch(() => ({}));
     }
@@ -100,7 +102,11 @@ async function ensureBase() {
   for (const base of candidates) {
     try {
       const r = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(1500) });
-      if (r.ok) return base;
+      if (r.ok) {
+        // 端口是共享范围，只认本项目：否则会把别的项目的 Agent 当成自己
+        const payload = await r.json().catch(() => null);
+        if (payload?.data?.project === 'qingying') return base;
+      }
     } catch { /* 继续尝试 */ }
   }
   // 自动拉起：约定 agent/launch.json = {"command":"node","args":["agent/server.mjs"],"ready_port":8791}
@@ -115,7 +121,9 @@ async function ensureBase() {
     for (let p = port; p < port + 12; p++) {
       try {
         const r = await fetch(`http://127.0.0.1:${p}/api/health`, { signal: AbortSignal.timeout(800) });
-        if (r.ok) return `http://127.0.0.1:${p}`;
+        if (!r.ok) continue;
+        const payload = await r.json().catch(() => null);
+        if (payload?.data?.project === 'qingying') return `http://127.0.0.1:${p}`;
       } catch { /* 未就绪 */ }
     }
   }
@@ -130,7 +138,7 @@ function err(id, code, message) { return { jsonrpc: '2.0', id, error: { code, me
 async function handle(req) {
   const { id, method, params } = req;
   if (method === 'initialize') {
-    return msg(id, { protocolVersion: PROTOCOL, capabilities: { tools: {} }, serverInfo: SERVER_INFO });
+    return msg(id, { protocolVersion: PROTOCOLS.includes(String(params?.protocolVersion || '').trim()) ? String(params.protocolVersion).trim() : PROTOCOL, capabilities: { tools: {} }, serverInfo: SERVER_INFO });
   }
   if (method === 'notifications/initialized' || method === 'initialized') return null;
   if (method === 'ping') return msg(id, {});

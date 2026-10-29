@@ -1,6 +1,6 @@
 {
   "name": "qingying-downloader",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "A secure Electron frontend for yt-dlp and gallery-dl with automatic engine routing, batch queue, per-site login sessions and a local Agent API.",
   "main": "electron/main.cjs",
   "author": "Codex",
@@ -36,6 +36,15 @@
       "!**/*.tmp"
     ],
     "asar": true,
+    "extraResources": [
+      {
+        "from": "resources/bin",
+        "to": "bin",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
     "win": {
       "target": [
         "dir",

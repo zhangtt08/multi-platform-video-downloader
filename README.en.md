@@ -24,6 +24,15 @@
 
 ---
 
+## 🆕 What's new in v1.6.0 (2026-10-29)
+
+- **Douyin fixed** (issue #1): Douyin's detail API requires a signature computed by the page itself, which no CLI can reproduce (`Fresh cookies`). The app now resolves the post inside the logged-in in-app browser and hands the signed direct URLs to yt-dlp — progress, resume and retries stay intact.
+- **Douyin image posts**: `/note/` links now save the watermark-free images.
+- **Thumbnails fixed**: Electron blocks a manually set `Referer` header, so the standard `referrer` option is used instead.
+- **Honest failure reasons**: Douyin is no longer mislabelled as "unsupported URL".
+
+---
+
 ## 🎯 Highlights & Features
 
 - **Dual Engine Architecture**: Combines `yt-dlp` for videos and `gallery-dl` for multi-image galleries with automatic seamless fallback.
@@ -36,8 +45,8 @@
 
 ## 🚀 Quick Start
 
-### Option 1: Run Pre-built Desktop App
-1. Launch the executable from the project directory.
+### Option 1: Install the pre-built app (recommended)
+1. Download `qingying-downloader-1.6.0-win-x64.exe` from [Releases](https://github.com/zhangtt08/multi-platform-video-downloader/releases/latest) and install it.
 2. Paste any supported video or post URL into the search bar.
 3. Click **Download**!
 

@@ -16,7 +16,7 @@ const ROOT = path.resolve(__dirname, '..');
 const DIST = path.join(ROOT, 'dist');
 const APP_NAME = '清影下载器';
 const ENGINE_EXES = ['yt-dlp.exe', 'gallery-dl.exe', 'ffmpeg.exe'];
-const WANT = ['electron/main.cjs', 'electron/local-guard.cjs', 'electron/preload.cjs', 'electron/engine-core.cjs', 'electron/agent-api.cjs', 'renderer/index.html', 'renderer/app.js', 'agent/server.mjs', 'agent/tools.mjs', 'agent/mcp-server.mjs'];
+const WANT = ['electron/main.cjs', 'electron/local-guard.cjs', 'electron/preload.cjs', 'electron/engine-core.cjs', 'electron/douyin-browser.cjs', 'electron/agent-api.cjs', 'renderer/index.html', 'renderer/app.js', 'agent/server.mjs', 'agent/tools.mjs', 'agent/mcp-server.mjs'];
 
 let failures = 0;
 function report(name, ok, detail) {
@@ -111,7 +111,7 @@ if (fs.existsSync(packedAsar)) {
   report('packed asar has no cookie/history/settings data',
     !packedList.some((entry) => /auth-state\.json|history\.json|settings\.json|cookies\//.test(entry)), '');
   // 产物里的代码必须与仓库里的逐字节相同 —— 否则"构建可复现"这句话只是愿望。
-  for (const file of ['electron/main.cjs', 'electron/local-guard.cjs', 'electron/engine-core.cjs', 'agent/server.mjs']) {
+  for (const file of ['electron/main.cjs', 'electron/local-guard.cjs', 'electron/engine-core.cjs', 'electron/douyin-browser.cjs', 'agent/server.mjs']) {
     const shipped = asar.extractFile(packedAsar, file);
     const onDisk = fs.readFileSync(path.join(ROOT, file));
     report('shipped bytes identical to source: ' + file, Boolean(shipped) && shipped.equals(onDisk),
@@ -126,6 +126,12 @@ if (enginesHere.length) {
   fs.mkdirSync(targetBin, { recursive: true });
   for (const name of enginesHere) fs.copyFileSync(path.join(ROOT, 'resources', 'bin', name), path.join(targetBin, name));
   report('engine binaries bundled into resources/bin', ENGINE_EXES.every((n) => fs.existsSync(path.join(targetBin, n))), enginesHere.join(','));
+  // 安装包也必须带上引擎：extraResources 把 resources/bin 复制进 <app>/resources/bin，
+  // 缺这一段时"装完却下不了"正是用户看到的样子。
+  const buildCfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).build || {};
+  const extra = Array.isArray(buildCfg.extraResources) ? buildCfg.extraResources : [];
+  report('installer config carries resources/bin via extraResources',
+    extra.some((entry) => entry && entry.from === 'resources/bin' && entry.to === 'bin'));
 } else {
   info('INFO  engines not bundled: resources/bin is empty (yt-dlp/gallery-dl/ffmpeg are gitignored).');
   info('INFO  the packaged app reports them as 未安装 until you put the pinned exes there or on PATH.');

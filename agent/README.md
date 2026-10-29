@@ -56,3 +56,17 @@ POST /api/agent/tool      唯一调用入口，body = {tool, input}，必须带 
 
 引擎调用、任务队列与登录会话都复用应用自己的模块（`electron/engine-core.cjs` 等），
 Agent 与桌面窗口看到的是同一套状态，不存在第二份实现。
+
+## 引擎与抖音
+
+`qingying.parse` 返回的 `engine` 可能是 `browser`：抖音的详情接口要网页现算的签名，
+命令行（yt-dlp）复现不了，所以桌面应用改用**应用内登录会话里的浏览器**取作品数据，
+再把签名好的直链交给 yt-dlp 下载。`browser` 只在桌面应用进程内可用（`GET /api/health`
+的 `engine` 列表里列出来了）；独立的 `agent/server.mjs` 没有浏览器，抖音会如实报错，
+不会假装成功。
+
+## 统一入口（一个 MCP / 一个 HTTP API）
+
+五个软件（AI Flow、FrameBoost、Agent 对话管理、清影下载器、声析）可以由
+`Desktop/项目/agent-bus` 一个入口统一调用：本项目的 `qingying.*` 工具原样暴露，
+服务没起时会自动拉起。见 `agent-bus/README.md`。本项目自己的 `agent/mcp-server.mjs` 仍可单独使用。

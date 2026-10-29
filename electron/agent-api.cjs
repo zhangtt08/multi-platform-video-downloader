@@ -77,7 +77,8 @@ function createAgentApiServer(deps) {
         ok: true,
         tool: 'qingying-downloader',
         version,
-        engine: ['yt-dlp', 'gallery-dl'],
+        engine: ['yt-dlp', 'gallery-dl', 'browser'],
+        engine_note: 'browser = 应用内浏览器；抖音的作品数据只能由登录会话里的网页取得，需要桌面应用在运行。',
         guard: {
           host_allowlist: `127.0.0.1:${port} / localhost:${port} / [::1]:${port}`,
           token_required: true,

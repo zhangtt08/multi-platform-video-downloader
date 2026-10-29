@@ -664,12 +664,16 @@ const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 async function fetchThumbnailDataUrl(url, referer, fetchImpl) {
   if (!isHttpUrl(url)) return '';
   const doFetch = fetchImpl || (async (target) => {
-    const buffer = await fetchBuffer(target, { 'User-Agent': 'Mozilla/5.0', Referer: referer }, 0, 8 * 1024 * 1024);
+    const buffer = await fetchBuffer(target, { 'User-Agent': BROWSER_UA, Referer: referer }, 0, 8 * 1024 * 1024);
     return { ok: true, headers: { get: () => '' }, arrayBuffer: async () => buffer };
   });
   try {
+    // Electron 的 net.fetch 会把"手工设置的 Referer 头"直接拦成
+    // net::ERR_BLOCKED_BY_CLIENT（Chromium 只认 fetch 的 referrer 选项），
+    // 所以退回标准写法：referrer + referrerPolicy 交给 Chromium 自己拼头。
     const response = await doFetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0', ...(isHttpUrl(referer) ? { Referer: referer } : {}) },
+      headers: { 'User-Agent': BROWSER_UA },
+      ...(isHttpUrl(referer) ? { referrer: referer, referrerPolicy: 'unsafe-url' } : {}),
     });
     if (!response || response.ok === false) return '';
     const getter = response.headers && typeof response.headers.get === 'function' ? response.headers : null;
@@ -748,6 +752,167 @@ function mapFormats(info) {
   return { videos, audios };
 }
 
+// ── 抖音：网页解析结果的映射 ───────────────────────────────────────────────
+// yt-dlp 的抖音链路只调 aweme/detail 这个签名接口，a_bogus 由网页 JS 现算，命令行
+// 复现不出来，所以它一律报 "Fresh cookies"。真正拿得到数据的是应用内登录会话里的
+// 那个网页：它自己会发 aweme/detail。这里负责把那份 JSON 映射成和 yt-dlp 一样的
+// 形状，下载时再把已经签名好的 play 地址写进 info json 交给 yt-dlp。
+function firstHttpUrl(list) {
+  if (!Array.isArray(list)) return '';
+  for (const item of list) {
+    const url = safeText(item, 2048).trim();
+    if (isHttpUrl(url)) return url;
+  }
+  return '';
+}
+
+function extFromUrl(url) {
+  try {
+    const hit = /\.([a-z0-9]{2,5})$/i.exec(new URL(url).pathname);
+    const ext = hit ? hit[1].toLowerCase() : '';
+    return IMAGE_EXTENSIONS.has(ext) ? ext : '';
+  } catch {
+    return '';
+  }
+}
+
+// 返回按高度去重后的候选（每个高度只留码率最高的一条），顺序固定：
+// mapDouyinDetail 与 buildDouyinInfoJson 各自调用一次，靠同一顺序对齐 format_id。
+function collectDouyinFormats(detail) {
+  const video = (detail && detail.video) || {};
+  const gears = Array.isArray(video.bit_rate) ? video.bit_rate : [];
+  const candidates = [];
+  for (const gear of gears) {
+    if (!gear || typeof gear !== 'object') continue;
+    const addr = gear.play_addr || {};
+    const url = firstHttpUrl(addr.url_list);
+    if (!url) continue;
+    candidates.push({
+      url,
+      width: Number(addr.width) || Number(video.width) || 0,
+      height: Number(addr.height) || Number(video.height) || 0,
+      kbps: Math.round((Number(gear.bit_rate) || 0) / 1000),
+      gear: safeText(gear.gear_name, 40),
+      ext: safeExt(gear.format) || 'mp4',
+    });
+  }
+  if (!candidates.length) {
+    const addr = video.play_addr || {};
+    const url = firstHttpUrl(addr.url_list);
+    if (url) {
+      candidates.push({
+        url,
+        width: Number(video.width) || 0,
+        height: Number(video.height) || 0,
+        kbps: 0,
+        gear: '原始清晰度',
+        ext: 'mp4',
+      });
+    }
+  }
+  const bestByHeight = new Map();
+  for (const item of candidates) {
+    const key = item.height || item.width || item.kbps || 0;
+    const current = bestByHeight.get(key);
+    if (!current || item.kbps > current.kbps) bestByHeight.set(key, item);
+  }
+  return [...bestByHeight.values()]
+    .sort((a, b) => b.height - a.height || b.kbps - a.kbps)
+    .slice(0, 10);
+}
+
+function douyinFormatId(item, used) {
+  let id = item.height ? 'dj-' + item.height + 'p' : 'dj-src';
+  if (used.has(id)) {
+    let index = 2;
+    while (used.has(id + '-' + index)) index += 1;
+    id += '-' + index;
+  }
+  used.add(id);
+  return id;
+}
+
+function mapDouyinDetail(detail, pageUrl) {
+  const video = (detail && detail.video) || {};
+  const used = new Set();
+  const videos = collectDouyinFormats(detail).map((item) => ({
+    id: douyinFormatId(item, used),
+    ext: 'mp4',
+    resolution: item.width && item.height ? item.width + 'x' + item.height : (item.height ? item.height + 'p' : '源文件'),
+    height: item.height,
+    fps: 0,
+    codec: '源编码',
+    // 抖音的 play 地址本身就是音视频合流，不需要再挑音轨合并。
+    hasAudio: true,
+    size: '',
+    note: [item.gear, item.kbps ? item.kbps + ' kbps' : ''].filter(Boolean).join(' · '),
+  }));
+  const images = (Array.isArray(detail && detail.images) ? detail.images : [])
+    .map((image) => {
+      const url = firstHttpUrl(image && image.download_url_list) || firstHttpUrl(image && image.url_list);
+      if (!url) return null;
+      return {
+        url,
+        ext: extFromUrl(url) || 'jpg',
+        filename: '',
+        width: Number(image.width) || 0,
+        height: Number(image.height) || 0,
+        postIndex: 0,
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 300);
+  const desc = safeText(detail && detail.desc, 300).replace(/\s+/g, ' ').trim();
+  const author = safeText(detail && detail.author && detail.author.nickname, 200);
+  const cover = firstHttpUrl(video.cover && video.cover.url_list)
+    || firstHttpUrl(video.origin_cover && video.origin_cover.url_list);
+  return {
+    title: desc || '未命名内容',
+    uploader: author,
+    duration: Math.round((Number(video.duration) || 0) / 1000),
+    webpageUrl: pageUrl,
+    webpageBasename: '抖音',
+    sessionId: 'douyin',
+    siteLabel: '抖音',
+    thumbnailUrl: cover,
+    playlistCount: 0,
+    videos,
+    audios: [],
+    images,
+  };
+}
+
+function buildDouyinInfoJson(detail, pageUrl, userAgent) {
+  const media = mapDouyinDetail(detail, pageUrl);
+  const used = new Set();
+  const formats = collectDouyinFormats(detail).map((item, index) => ({
+    format_id: douyinFormatId(item, used),
+    url: item.url,
+    ext: 'mp4',
+    width: item.width,
+    height: item.height,
+    vcodec: 'avc1',
+    acodec: 'aac',
+    // CDN 按 Referer/UA 判定来源；UA 必须和浏览器里取到直链的那次一致。
+    http_headers: {
+      'User-Agent': userAgent || BROWSER_UA,
+      Referer: 'https://www.douyin.com/',
+    },
+    format_note: media.videos[index] ? media.videos[index].note : '',
+  }));
+  return {
+    id: String((detail && detail.aweme_id) || '') || 'douyin',
+    title: media.title,
+    uploader: media.uploader,
+    duration: media.duration,
+    webpage_url: pageUrl,
+    extractor: 'douyin-browser',
+    extractor_key: 'DouyinBrowser',
+    thumbnail: media.thumbnailUrl,
+    formats,
+  };
+}
+
 function parseGalleryDlJson(stdout) {
   let parsed;
   try {
@@ -792,28 +957,39 @@ function parseGalleryDlJson(stdout) {
 // 返回的 chain 是**完整判定过程**（含本机不可用的那一步，标 unavailable），
 // executable 才是真会跑的序列。界面把 chain 原样摊开，用户看得见"为什么用它、
 // 备胎为什么没上"，降级永远不会是静默的。
-function planEngine(url, engines, preference) {
+function planEngine(url, engines, preference, options) {
+  const opts = options || {};
   const site = matchLoginSite(url);
   // 探测结果用的键是 yt_dlp / gallery_dl（下划线），决策里说的是 yt-dlp / gallery-dl（连字符）。
   // 这里必须换算，否则"备胎在不在本机"永远被判成不在 —— 界面会说假话。
   const keyOf = (name) => (name === 'yt-dlp' ? 'yt_dlp' : name === 'gallery-dl' ? 'gallery_dl' : name);
-  const has = (name) => Boolean(engines && engines[keyOf(name)] && engines[keyOf(name)].available);
+  const has = (name) => (name === 'browser'
+    ? opts.browserAvailable === true
+    : Boolean(engines && engines[keyOf(name)] && engines[keyOf(name)].available));
   const imageSite = Boolean(site && site.contentKind === 'images');
+  // 抖音：yt-dlp 拿不到数据（接口签名只有网页 JS 会算），gallery-dl 根本没有抖音
+  // 提取器（只会回一句 Unsupported URL，把真正的原因盖掉）。所以只留浏览器 + yt-dlp。
+  const douyinBrowser = Boolean(site && site.id === 'douyin' && opts.browserAvailable === true);
 
   // yt-dlp 先上：它能给出作者/标题/画质；图集链接在它手里会"没有音视频格式"，
   // 那正是降级 gallery-dl 的信号。
-  const ordered = imageSite
+  const ordered = douyinBrowser
     ? [
-      { engine: 'yt-dlp', why: (site.label + ' 的链接先按视频解析，能拿到作者与标题等元信息') },
-      { engine: 'gallery-dl', why: 'yt-dlp 没有给出音视频格式时，说明这条链接是图集，自动降级 gallery-dl' },
+      { engine: 'browser', why: '抖音的接口签名只有网页自己会算，用应用内登录会话的浏览器取作品数据' },
+      { engine: 'yt-dlp', why: '应用内浏览器没拿到数据时，再用 yt-dlp 试一次' },
     ]
-    : [
-      {
-        engine: 'yt-dlp',
-        why: site ? site.label + ' 属于视频站点，用 yt-dlp 取画质与音轨' : '通用链接按视频解析，用 yt-dlp 取画质与音轨',
-      },
-      { engine: 'gallery-dl', why: 'yt-dlp 判定这条链接其实是图片时，自动降级 gallery-dl' },
-    ];
+    : imageSite
+      ? [
+        { engine: 'yt-dlp', why: (site.label + ' 的链接先按视频解析，能拿到作者与标题等元信息') },
+        { engine: 'gallery-dl', why: 'yt-dlp 没有给出音视频格式时，说明这条链接是图集，自动降级 gallery-dl' },
+      ]
+      : [
+        {
+          engine: 'yt-dlp',
+          why: site ? site.label + ' 属于视频站点，用 yt-dlp 取画质与音轨' : '通用链接按视频解析，用 yt-dlp 取画质与音轨',
+        },
+        { engine: 'gallery-dl', why: 'yt-dlp 判定这条链接其实是图片时，自动降级 gallery-dl' },
+      ];
 
   const wanted = preference === 'yt-dlp' || preference === 'gallery-dl' ? preference : '';
   let chain = ordered.map((step, index) => ({
@@ -926,6 +1102,21 @@ async function analyzeWithGalleryDl(spec) {
   };
 }
 
+async function analyzeWithBrowser(spec) {
+  const resolved = await spec.browserProvider(spec.url);
+  if (!resolved || resolved.ok !== true || !resolved.detail) {
+    throw new EngineError(
+      (resolved && resolved.kind) || 'browser_failed',
+      (resolved && resolved.error) || '应用内浏览器没有拿到这个作品的数据。',
+    );
+  }
+  const data = mapDouyinDetail(resolved.detail, spec.url);
+  if (!data.videos.length && !data.images.length) {
+    throw new EngineError('no_formats', '应用内浏览器打开的作品没有可下载的格式。');
+  }
+  return { engine: 'browser', engineVersion: resolved.browserVersion || '', data };
+}
+
 // ── 失败归因：把引擎的原始抱怨翻译成"下一步能点什么" ───────────────────────
 // 六条出路必须分得开，因为它们下一步完全不同：
 //   链接不支持(unsupported_url) / 链接已失效(link_gone) / 需要登录(login_required)
@@ -1006,7 +1197,8 @@ async function analyzeUrl(spec) {
   const url = normalizeMediaUrl(raw);
   const site = matchLoginSite(url);
   const engines = spec.engines || {};
-  const plan = planEngine(url, engines, spec.preference);
+  const browserAvailable = Boolean(site && site.id === 'douyin' && typeof spec.browserProvider === 'function');
+  const plan = planEngine(url, engines, spec.preference, { browserAvailable });
   const attempts = [];
   const chain = plan.executable;
   const planText = plan.chain.map((step) => step.engine + '：' + step.reason).join('；');
@@ -1052,14 +1244,18 @@ async function analyzeUrl(spec) {
 
   for (const step of chain) {
     const startedAt = Date.now();
-    const record = engines[step.engine === 'yt-dlp' ? 'yt_dlp' : 'gallery_dl'];
-    const executable = record && record.path
-      ? record.path
-      : (step.engine === 'yt-dlp' ? 'yt-dlp' : 'gallery-dl');
+    const record = step.engine === 'browser' ? null : engines[step.engine === 'yt-dlp' ? 'yt_dlp' : 'gallery_dl'];
+    const executable = step.engine === 'browser'
+      ? ''
+      : (record && record.path
+        ? record.path
+        : (step.engine === 'yt-dlp' ? 'yt-dlp' : 'gallery-dl'));
     try {
-      const result = step.engine === 'yt-dlp'
-        ? await analyzeWithYtDlp({ url, executable, cookieFile, timeoutMs: spec.timeoutMs, proxy: spec.proxy })
-        : await analyzeWithGalleryDl({ url, executable, cookieFile, timeoutMs: spec.timeoutMs, proxy: spec.proxy });
+      const result = step.engine === 'browser'
+        ? await analyzeWithBrowser({ url, browserProvider: spec.browserProvider })
+        : step.engine === 'yt-dlp'
+          ? await analyzeWithYtDlp({ url, executable, cookieFile, timeoutMs: spec.timeoutMs, proxy: spec.proxy })
+          : await analyzeWithGalleryDl({ url, executable, cookieFile, timeoutMs: spec.timeoutMs, proxy: spec.proxy });
 
       if (!result) {
         attempts.push({ engine: step.engine, outcome: 'no_result', ms: Date.now() - startedAt, detail: step.reason });
@@ -1073,8 +1269,10 @@ async function analyzeUrl(spec) {
       const usedChain = attempts.concat([{ engine: result.engine, outcome: 'ok', ms: Date.now() - startedAt, detail: step.reason }]);
       const imageOnly = !result.data.videos.length && !result.data.audios.length && result.data.images.length > 0;
       result.data.engine = result.engine;
-      result.data.engine_version = record && record.version ? record.version : '';
-      result.data.engine_source = record && record.source ? record.source : '';
+      result.data.engine_version = step.engine === 'browser'
+        ? (result.engineVersion || '')
+        : (record && record.version ? record.version : '');
+      result.data.engine_source = step.engine === 'browser' ? '应用内浏览器' : (record && record.source ? record.source : '');
       result.data.engine_reason = describeEngineChoice(result.engine, step.reason, usedChain, imageOnly, Boolean(cookieFile));
       result.data.engine_chain = usedChain;
       result.data.engine_plan = plan.chain;
@@ -1094,8 +1292,9 @@ async function analyzeUrl(spec) {
       });
       // 图片链路失败或只有它一条时，直接给归因；否则继续尝试下一个引擎。
       const isLast = chain.indexOf(step) === chain.length - 1;
-      if (!isLast) continue;
       const diagnosis = classifyParseError(error.message, site, step.engine);
+      // 浏览器自己说"要登录/要验证"时，yt-dlp 只会重复同一个结论（还多花两秒），直接收口。
+      if (!isLast && !(step.engine === 'browser' && diagnosis.kind === 'login_required')) continue;
       if (site && site.cookieHint && !cookieFile) {
         diagnosis.remedies.unshift({ action: 'login', label: '登录 ' + site.label, detail: site.cookieHint });
       }
@@ -1127,7 +1326,12 @@ async function analyzeUrl(spec) {
 
 function describeEngineChoice(engine, reason, chain, imageOnly, hasCookie) {
   const triedOthers = chain.filter((a) => a.engine !== engine && a.outcome !== 'ok').map((a) => a.engine + '(' + a.outcome + ')');
-  const parts = [engine === 'yt-dlp' ? 'yt-dlp（视频/音频链路）' : 'gallery-dl（图片链路）', reason];
+  const names = {
+    'yt-dlp': 'yt-dlp（视频/音频链路）',
+    'gallery-dl': 'gallery-dl（图片链路）',
+    browser: '应用内浏览器（抖音网页解析）',
+  };
+  const parts = [names[engine] || engine, reason];
   if (triedOthers.length) parts.push('先试过 ' + triedOthers.join('、') + '，没有可用结果');
   if (imageOnly) parts.push('这条链接只有图片，没有音视频格式');
   parts.push(hasCookie ? '已带上本机登录会话' : '未登录（匿名解析）');
@@ -1179,6 +1383,18 @@ function buildDownloadArgs(spec) {
     args.push('-f', spec.videoId);
   } else {
     args.push('-f', spec.audioId, '-x', '--audio-format', AUDIO_FORMATS.includes(spec.audioFormat) ? spec.audioFormat : 'mp3');
+  }
+  // 抖音的直链是网页现签名出来的，命令行走不了抽取那一步：把已经签好的格式写进
+  // info json，用 --load-info-json 让 yt-dlp 直接下载（进度/续传/重试都照旧）。
+  const infoJsonPath = safeText(spec.infoJsonPath, 1024).trim();
+  if (infoJsonPath) {
+    const formatArgIndex = args.lastIndexOf('-f');
+    // 画质档位在两次解析之间可能少一档（站点分档会变），退到 best 而不是直接失败。
+    if (formatArgIndex >= 0 && args[formatArgIndex + 1] && !args[formatArgIndex + 1].includes('+')) {
+      args[formatArgIndex + 1] += '/best';
+    }
+    args.push('--load-info-json', path.resolve(infoJsonPath));
+    return args;
   }
   args.push(spec.url);
   return args;
@@ -2046,10 +2262,14 @@ module.exports = {
   fetchBuffer,
   fetchThumbnailDataUrl,
   mapFormats,
+  collectDouyinFormats,
+  mapDouyinDetail,
+  buildDouyinInfoJson,
   parseGalleryDlJson,
   planEngine,
   analyzeWithYtDlp,
   analyzeWithGalleryDl,
+  analyzeWithBrowser,
   analyzeUrl,
   classifyParseError,
   buildDownloadArgs,

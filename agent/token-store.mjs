@@ -79,6 +79,8 @@ function createOrAdopt(file, candidate) {
 export function readAgentToken(projectId, env = process.env) {
   // QINGYING_API_TOKEN 是项目对外公开名（README/桌面壳），AGENT_API_TOKEN 是标准模板名；两者同权。
   const fromEnv = String(env.QINGYING_API_TOKEN ?? env.AGENT_API_TOKEN ?? '').trim();
+  if (fromEnv) return fromEnv;
+  return readFileToken(agentTokenFile(projectId, env));
 }
 
 /**

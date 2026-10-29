@@ -4,6 +4,7 @@ const path = require('node:path');
 const core = require('./engine-core.cjs');
 const guard = require('./local-guard.cjs');
 const { startAgentApi, DEFAULT_API_PORT } = require('./agent-api.cjs');
+const { resolveDouyinDetail } = require('./douyin-browser.cjs');
 
 const LOGIN_SITES = core.LOGIN_SITES;
 const SITE_IDS = core.SITE_IDS;
@@ -155,6 +156,25 @@ function releaseCookieFile(file) {
   return core.removeCookieFile(file, TEMP_DIR());
 }
 
+// 抖音的作品数据只能从登录会话里的网页拿（详见 douyin-browser.cjs）。
+function browserResolve(url) {
+  return resolveDouyinDetail({ url, partition: LOGIN_SITES.douyin.partition });
+}
+
+function writeInfoJsonFile(detail, url, userAgent) {
+  const dir = core.ensureDirSync(path.join(DATA_DIR(), 'cache'));
+  const file = path.join(dir, 'douyin-info-' + process.pid + '-' + Date.now() + '.json');
+  const info = core.buildDouyinInfoJson(detail, url, userAgent || '');
+  fs.writeFileSync(file, JSON.stringify(info), { encoding: 'utf8', mode: 0o600 });
+  return file;
+}
+
+function removeInfoJsonFile(file) {
+  if (!file) return;
+  if (!path.basename(file).startsWith('douyin-info-')) return;
+  try { fs.rmSync(file, { force: true }); } catch {}
+}
+
 async function collectAuthSnapshot() {
   const sites = {};
   for (const siteId of SITE_IDS) {
@@ -218,6 +238,7 @@ async function analyzeMedia(payload) {
         if (file) createdCookies.push(file);
         return file;
       },
+      browserProvider: browserResolve,
       fetchThumbnail: (target, init) => net.fetch(target, init),
     });
   } finally {
@@ -260,7 +281,7 @@ function makeTask(input) {
     audioExt: core.safeExt(input.audioExt),
     audioFormat: core.AUDIO_FORMATS.includes(input.audioFormat) ? input.audioFormat : settings.audioFormat,
     images: Array.isArray(input.images) ? input.images.slice(0, 500) : [],
-    engine: ['yt-dlp', 'gallery-dl'].includes(input.engine) ? input.engine : '',
+    engine: ['yt-dlp', 'gallery-dl', 'browser'].includes(input.engine) ? input.engine : '',
     site: LOGIN_SITES[input.site] ? input.site : '',
     outputDir: core.safeText(input.outputDir, 1024).trim() || settings.outputDir,
     status: 'queued',
@@ -483,6 +504,33 @@ async function runTask(task) {
     } else {
       if (!engines.yt_dlp?.available) {
         result = { ok: false, kind: 'engine_missing', error: '本机找不到 yt-dlp，无法下载视频或音频。', files: [], bytes: 0 };
+      } else if (task.videoId.startsWith('dj-')) {
+        // 抖音画质对应的是网页现签的直链，放一会儿就会过期；下载前重新解析一次，
+        // 再把新鲜直链交给 yt-dlp（--load-info-json），进度/续传/重试都走原路。
+        task.progress = { percent: '', speed: '', eta: '正在用应用内浏览器取直链…' };
+        emitQueue();
+        const resolved = await browserResolve(task.url);
+        if (!resolved.ok) {
+          result = { ok: false, kind: resolved.kind || 'browser_failed', error: resolved.error, files: [], bytes: 0 };
+        } else {
+          const infoFile = writeInfoJsonFile(resolved.detail, task.url, resolved.userAgent);
+          try {
+            task.log = core.appendTail(task.log, '抖音直链已重新签名，走 --load-info-json 下载\n', 4000);
+            result = await core.runEngineDownload({
+              ...commonSpec,
+              mode: task.mode,
+              videoId: task.videoId,
+              videoExt: task.videoExt,
+              videoHasAudio: task.videoHasAudio,
+              audioId: task.audioId,
+              audioExt: task.audioExt,
+              audioFormat: task.audioFormat,
+              infoJsonPath: infoFile,
+            }, hooks);
+          } finally {
+            removeInfoJsonFile(infoFile);
+          }
+        }
       } else {
         result = await core.runEngineDownload({
           ...commonSpec,
@@ -510,7 +558,12 @@ async function runTask(task) {
 
   if (result.ok) {
     task.status = 'done';
-    task.progress = { percent: '100%', speed: '', eta: '' };
+    // 引擎退出码 0 但什么都没落盘（最常见：同名文件已在、引擎直接跳过）。
+    // 报"完成 0 B"等于说假话，这里把原因摆在进度行上。
+    task.progress = task.files.length
+      ? { percent: '100%', speed: '', eta: '' }
+      : { percent: '', speed: '', eta: '没有新增文件：同名文件可能已存在，换个画质或清空该目录后再试' };
+    if (!task.files.length) task.log = core.appendTail(task.log, '引擎没有新增文件（同名文件已存在时会直接跳过）\n', 4000);
     task.finished_at = new Date().toISOString();
     recordHistory(task);
     emitQueue(true);

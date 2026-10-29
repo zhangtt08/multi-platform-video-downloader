@@ -184,6 +184,64 @@ const mapped = core.mapFormats({ formats: [
 ] });
 report('mapFormats splits video/audio', mapped.videos.length === 1 && mapped.audios.length === 1);
 
+// 7h) 抖音：网页解析结果 → 格式列表 / info json / 引擎判定。
+//     这一路是 issue #1 的根因修复：命令行拿不到抖音数据，只有登录会话里的网页拿得到。
+const douyinDetail = {
+  aweme_id: '7692418564459881721',
+  desc: '测试作品 #标签',
+  author: { nickname: '作者甲' },
+  video: {
+    duration: 8267,
+    width: 1080,
+    height: 1920,
+    cover: { url_list: ['https://p3.douyinpic.com/a.jpeg'] },
+    bit_rate: [
+      { gear_name: 'normal_1080_0', bit_rate: 1788006, format: 'mp4', play_addr: { width: 1080, height: 1920, url_list: ['https://v11.douyinvod.com/hi.mp4'] } },
+      { gear_name: 'normal_1080_1', bit_rate: 1163000, format: 'mp4', play_addr: { width: 1080, height: 1920, url_list: ['https://v11.douyinvod.com/lo.mp4'] } },
+      { gear_name: 'normal_720_0', bit_rate: 1266671, format: 'mp4', play_addr: { width: 720, height: 1280, url_list: ['https://v11.douyinvod.com/720.mp4'] } },
+    ],
+  },
+  images: [],
+};
+const douyinMedia = core.mapDouyinDetail(douyinDetail, 'https://www.douyin.com/video/7692418564459881721');
+report('douyin detail keeps one format per height, highest bitrate wins',
+  douyinMedia.videos.length === 2 && douyinMedia.videos[0].id === 'dj-1920p' && /1788 kbps/.test(douyinMedia.videos[0].note),
+  JSON.stringify(douyinMedia.videos.map((v) => v.id)));
+report('douyin formats are muxed (no separate audio pick)',
+  douyinMedia.videos.every((v) => v.hasAudio === true) && douyinMedia.audios.length === 0);
+report('douyin title/uploader/duration mapped',
+  douyinMedia.title === '测试作品 #标签' && douyinMedia.uploader === '作者甲' && douyinMedia.duration === 8);
+report('douyin renderer payload never carries CDN urls',
+  !JSON.stringify(douyinMedia.videos).includes('douyinvod'));
+const douyinInfo = core.buildDouyinInfoJson(douyinDetail, 'https://www.douyin.com/video/7692418564459881721', 'UA-TEST');
+report('douyin info json keeps signed url + referer/UA',
+  douyinInfo.formats.length === 2 && douyinInfo.formats[0].url === 'https://v11.douyinvod.com/hi.mp4'
+  && douyinInfo.formats[0].http_headers.Referer === 'https://www.douyin.com/'
+  && douyinInfo.formats[0].http_headers['User-Agent'] === 'UA-TEST');
+const douyinNote = core.mapDouyinDetail({
+  aweme_id: '1', desc: '图文', author: { nickname: 'b' }, video: {},
+  images: [{ download_url_list: ['https://p3.douyinpic.com/x.webp?x=1'], width: 1440, height: 2035 }],
+}, 'https://www.douyin.com/note/1');
+report('douyin note maps images and no video',
+  douyinNote.videos.length === 0 && douyinNote.images.length === 1 && douyinNote.images[0].ext === 'webp');
+const douyinPlan = core.planEngine('https://www.douyin.com/video/1',
+  { yt_dlp: { available: true }, gallery_dl: { available: true } }, 'auto', { browserAvailable: true });
+report('douyin plans browser first and drops gallery-dl',
+  douyinPlan.chain.length === 2 && douyinPlan.primary === 'browser'
+  && !douyinPlan.chain.some((step) => step.engine === 'gallery-dl'),
+  JSON.stringify(douyinPlan.chain.map((s) => s.engine)));
+report('without a browser the douyin plan stays the legacy chain',
+  core.planEngine('https://www.douyin.com/video/1', { yt_dlp: { available: true }, gallery_dl: { available: true } }, 'auto').primary === 'yt-dlp');
+const infoArgs = core.buildDownloadArgs({
+  url: 'https://www.douyin.com/video/1', outputDir: 'C:/tmp/out', mode: 'combined',
+  videoId: 'dj-1920p', videoExt: 'mp4', videoHasAudio: true, audioId: '', audioExt: '',
+  site: null, cookieFile: '', ffmpegLocation: 'ff', filenameTemplate: core.DEFAULT_FILENAME_TEMPLATE,
+  infoJsonPath: 'C:/tmp/info.json',
+});
+report('info-json download drops the page url and falls back to best',
+  infoArgs.includes('--load-info-json') && infoArgs[infoArgs.indexOf('-f') + 1] === 'dj-1920p/best'
+  && !infoArgs.includes('https://www.douyin.com/video/1'), infoArgs.join(' ').slice(0, 160));
+
 // 7g) 引擎输出行解析 —— 这一段曾经引用过一个根本没定义的常量，
 //     真实下载第一行输出就把主进程整个带崩（npm run check 当时照样全绿）。
 const progressLine = core.parseEngineLine('download:  45.3%| 1.20MiB/s|00:00:12');

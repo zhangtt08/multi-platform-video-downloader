@@ -547,6 +547,14 @@ const OUTCOME_LABELS = {
   failed: '报错',
 };
 
+// 引擎对外显示名：内部标识（browser）不该原样糊到用户脸上。
+const CHAIN_ENGINE_LABELS = {
+  'yt-dlp': 'yt-dlp',
+  'gallery-dl': 'gallery-dl',
+  browser: '应用内浏览器',
+};
+const engineName = (name) => CHAIN_ENGINE_LABELS[name] || name || '';
+
 // 引擎判定过程：谁先上、为什么、备胎有没有试过 —— 降级永远是看得见的。
 function renderChainList(container, steps) {
   container.replaceChildren();
@@ -554,7 +562,7 @@ function renderChainList(container, steps) {
     const item = document.createElement('li');
     item.className = `chain-step outcome-${step.outcome || (step.available === false ? 'unavailable' : 'planned')}`;
     const head = document.createElement('strong');
-    head.textContent = step.engine
+    head.textContent = engineName(step.engine)
       + (step.role === 'fallback' ? '（备胎）' : step.role === 'primary' ? '（首选）' : '')
       + (step.outcome ? ` —— ${OUTCOME_LABELS[step.outcome] || step.outcome}` : (step.available === false ? ' —— 本机没有这个引擎，跳过' : ' —— 计划中'));
     item.append(head);
@@ -722,7 +730,7 @@ function renderMedia() {
     ? `${imageCount} 张图片 · 可直接保存原图`
     : `${formatDuration(media.duration)} · ${media.videos.length} 个视频格式 · ${media.audios.length} 个音频格式`;
   const versionSuffix = media.engine_version ? ` · 版本 ${media.engine_version}` : '';
-  elements.engineLine.textContent = `引擎：${media.engine}${versionSuffix} —— ${media.engine_reason || ''}`;
+  elements.engineLine.textContent = `引擎：${engineName(media.engine)}${versionSuffix} —— ${media.engine_reason || ''}`;
   const chainSteps = (media.engine_chain && media.engine_chain.length)
     ? media.engine_chain
     : (media.engine_plan || []);
@@ -1617,14 +1625,24 @@ elements.tempClean.addEventListener('click', async () => {
   await refreshTempFiles();
 });
 
+let queueRenderScheduled = false;
+let pendingQueueSnapshot = null;
 window.qingying.onQueueChanged((snapshot) => {
-  renderQueue(snapshot);
-  if (snapshot?.settings) applySettings(snapshot.settings);
-  if (snapshot?.engines) {
-    engines = snapshot.engines;
-    renderEngines();
+  pendingQueueSnapshot = snapshot;
+  if (!queueRenderScheduled) {
+    queueRenderScheduled = true;
+    requestAnimationFrame(() => {
+      queueRenderScheduled = false;
+      const snap = pendingQueueSnapshot;
+      renderQueue(snap);
+      if (snap?.settings) applySettings(snap.settings);
+      if (snap?.engines) {
+        engines = snap.engines;
+        renderEngines();
+      }
+      if (snap?.api) renderApiStatus(snap.api);
+    });
   }
-  if (snapshot?.api) renderApiStatus(snapshot.api);
 });
 window.qingying.onAuthChanged((snapshot) => {
   auth = snapshot;
