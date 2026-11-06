@@ -489,5 +489,231 @@ try {
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 
+// 8) 从主进程源码里"举起"一个顶层函数，注入依赖后真调用它。
+//    主进程整体 require 不了（要 Electron），但这些函数只依赖 core/path/fs 与一个目录，
+//    照原样搬过来跑，比对着源码文本猜"应该能用"可靠。
+function liftMainFunction(source, name) {
+  const start = source.indexOf('function ' + name + '(');
+  if (start < 0) throw new Error('no such function: ' + name);
+  let depth = 0;
+  let seen = false;
+  for (let i = source.indexOf('{', start); i < source.length; i += 1) {
+    if (source[i] === '{') { depth += 1; seen = true; }
+    else if (source[i] === '}') {
+      depth -= 1;
+      if (seen && depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  throw new Error('unbalanced function: ' + name);
+}
+
+function liftMain(names, deps) {
+  const source = fs.readFileSync(path.join(ROOT, 'electron', 'main.cjs'), 'utf8');
+  const body = names.map((name) => liftMainFunction(source, name)).join('\n');
+  const keys = Object.keys(deps);
+  const factory = new Function(...keys, body + '\nreturn {' + names.join(',') + '};');
+  return factory(...keys.map((key) => deps[key]));
+}
+
+// 8a) 删除：列表里每一种队列状态都必须有对应的删除说法
+//     （issue 原话"下载列表没有删除功能"——原来只有"已完成且有文件"的行才有删除项，
+//     失败/取消/暂停的行永远删不掉）。
+const statusMachineLine = (main.match(/\/\/ 状态机：([^\n]+)/) || ['', ''])[1];
+const QUEUE_STATUSES = [...new Set([...statusMachineLine.matchAll(/\b([a-z_]{4,})\b/g)].map((m) => m[1]))];
+report('queue status list parsed from main state machine comment', QUEUE_STATUSES.length >= 6, QUEUE_STATUSES.join(','));
+
+const deleteLabelsBlock = (appJs.match(/const DELETE_LABELS = \{([\s\S]*?)\n\};/) || ['', ''])[1];
+const deleteLabels = [...new Set([...deleteLabelsBlock.matchAll(/^\s{2}([a-z_]+):/gm)].map((m) => m[1]))];
+const unlabeledStatuses = QUEUE_STATUSES.filter((status) => !deleteLabels.includes(status));
+report('every queue status has a delete label', unlabeledStatuses.length === 0, unlabeledStatuses.join(','));
+
+const statusLabelsBlock = (appJs.match(/const STATUS_LABELS = \{([\s\S]*?)\n\};/) || ['', ''])[1];
+const statusLabelKeys = [...new Set([...statusLabelsBlock.matchAll(/^\s{2}([a-z_]+):/gm)].map((m) => m[1]))];
+report('delete labels stay inside the real status set',
+  deleteLabels.every((status) => statusLabelKeys.includes(status)),
+  deleteLabels.filter((status) => !statusLabelKeys.includes(status)).join(','));
+
+report('delete button is on the row, not hidden in the menu', /dataset\.removeTask = task\.id/.test(appJs));
+report('history rows delete one record', /dataset\.removeHistory = item\.id/.test(appJs)
+  && /window\.qingying\.removeHistoryItem\(/.test(appJs));
+report('delete no longer gated on done-with-files',
+  !/if \(task\.status === 'done' && task\.file_count\) \{\s*addMenuItem\('删除记录'/.test(appJs));
+report('row delete says files are untouched', /已下载的文件没有改动|不动已下载的文件/.test(appJs));
+
+const removeBlock = (main.match(/ipcMain\.handle\('queue:remove',[\s\S]*?\n\}\);/) || [''])[0];
+report('queue:remove stops a running task before deleting',
+  /task\.status === 'downloading'\) stopTask\(task, \{ pause: false \}/.test(removeBlock)
+  && /tasks\.delete\(id\)/.test(removeBlock));
+const clearBlock = (main.match(/ipcMain\.handle\('queue:clear-finished',[\s\S]*?\n\}\);/) || [''])[0];
+const clearedStatuses = ((clearBlock.match(/\[([^\]]*)\]\.includes/) || ['', ''])[1].match(/'([a-z_]+)'/g) || []).map((s) => s.replace(/'/g, ''));
+report('clear finished covers failed rows too',
+  ['done', 'cancelled', 'failed'].every((status) => clearedStatuses.includes(status)), clearedStatuses.join(','));
+report('clear finished never sweeps active rows',
+  !clearedStatuses.includes('downloading') && !clearedStatuses.includes('queued'), clearedStatuses.join(','));
+
+// 8b) 历史单条删除：真调用核心，删掉的必须只剩另一条，删不存在的必须回 false
+const tmpHistory = path.join(ROOT, '.check-history-' + process.pid);
+core.ensureDirSync(tmpHistory);
+try {
+  core.appendHistory(tmpHistory, { id: 'keep-1', url: 'https://a', title: 'KEEP', status: 'done', bytes: 1 });
+  core.appendHistory(tmpHistory, { id: 'drop-1', url: 'https://b', title: 'DROP', status: 'failed', bytes: 2 });
+  const removedOne = core.removeHistoryItem(tmpHistory, 'drop-1');
+  const left = core.readHistory(tmpHistory);
+  report('history single delete removes exactly one row', removedOne === true && left.length === 1 && left[0].id === 'keep-1', JSON.stringify(left.map((i) => i.id)));
+  report('history single delete refuses an unknown id', core.removeHistoryItem(tmpHistory, 'no-such-id') === false);
+  report('history single delete ignores empty id', core.removeHistoryItem(tmpHistory, '') === false);
+  report('history delete keeps the survivor file content', left[0].title === 'KEEP');
+} finally {
+  fs.rmSync(tmpHistory, { recursive: true, force: true });
+}
+
+// 8b2) 记录页刷新：历史一落盘就得播给界面。原来「记录」只在启动时读一次盘，
+//      下载完成的新记录要等重启才出现，删掉的行和盘上的行也对不上。
+const emitHistoryBlock = (main.match(/function emitHistory\(\) \{[\s\S]*?\n\}/) || [''])[0];
+report('history broadcast carries the stored list, not a guess',
+  /core\.readHistory\(DATA_DIR\(\)\)/.test(emitHistoryBlock)
+  && /sendToMain\('history:changed'/.test(emitHistoryBlock));
+const recordHistoryBlock = (main.match(/function recordHistory\(task\) \{[\s\S]*?\n\}/) || [''])[0];
+report('a finished task broadcasts its new history row', /appendHistory\([\s\S]*emitHistory\(\)/.test(recordHistoryBlock));
+const historyRemoveBlock = (main.match(/ipcMain\.handle\('history:remove',[\s\S]*?\n\}\);/) || [''])[0];
+report('single delete broadcasts only when a row really went', /if \(removed\) emitHistory\(\)/.test(historyRemoveBlock));
+const historyClearBlock = (main.match(/ipcMain\.handle\('history:clear',[\s\S]*?\n\}\);/) || [''])[0];
+report('clear-all broadcasts the empty list', /clearHistory\(DATA_DIR\(\)\)[\s\S]*emitHistory\(\)/.test(historyClearBlock));
+report('preload exposes the history channel',
+  /onHistoryChanged: \(callback\) => listener\('history:changed'/.test(preload));
+report('renderer subscribes and rerenders the record list',
+  /onHistoryChanged\(\(snapshot\) => renderHistory\(snapshot\?\.items \|\| \[\]\)\)/.test(appJs));
+
+// 8b3) 探测预算：yt-dlp 换版后第一次执行要等杀毒扫描，本机实测冷启动 34.5s。
+// 预算短于冷启动 = 冷启动被判成"引擎不可用"，界面随后拒绝一切下载。
+const probeEngineBlock = (fs.readFileSync(path.join(ROOT, 'electron', 'engine-core.cjs'), 'utf8')
+  .match(/async function probeEngine\(name, options\) \{[\s\S]*?\n\}/) || [''])[0];
+const probeBudget = Number(((probeEngineBlock.match(/probeTimeoutMs\) \|\| (\d+)/) || [0, '0'])[1]));
+report('engine probe budget survives a cold start', probeBudget >= 30000, probeBudget + 'ms');
+
+// 8c) 引擎优先级 + 下载目录自愈 + 升级取址安全：都在下面这段用真实临时目录跑
+function sectionEngineDirs() {
+  const tmp = path.join(ROOT, '.check-engines-' + process.pid);
+  const appPath = path.join(tmp, 'app');
+  const packagedBin = path.join(appPath, 'resources', 'bin');
+  const userData = path.join(tmp, 'userData', 'qingying');
+  const configuredDir = path.join(tmp, 'configured');
+  core.ensureDirSync(packagedBin);
+  core.ensureDirSync(configuredDir);
+  fs.writeFileSync(path.join(packagedBin, 'yt-dlp.exe'), 'bundled-old');
+  fs.writeFileSync(path.join(packagedBin, 'ffmpeg.exe'), 'bundled-ffmpeg');
+  fs.writeFileSync(path.join(configuredDir, 'yt-dlp.exe'), 'upgraded-new');
+  core.writeSettings(userData, { outputDir: tmp, enginesDir: configuredDir });
+  try {
+    const deps = {
+      path, fs, core,
+      // 主进程用 process.resourcesPath 定位安装包自带的引擎，这里给一个假的安装包位置。
+      process: { resourcesPath: path.join(appPath, 'resources') },
+      DATA_DIR: () => userData,
+      app: { isPackaged: true, getAppPath: () => appPath, getPath: () => path.join(tmp, 'userData') },
+    };
+    const lifted = liftMain(['isEngineFile', 'engineOptions'], deps);
+    const opts = lifted.engineOptions();
+    report('configured engine dir beats the packaged copy',
+      opts.overrides['yt-dlp'] === path.join(configuredDir, 'yt-dlp.exe'), opts.overrides['yt-dlp']);
+    report('engine missing from configured dir falls back to packaged copy',
+      opts.overrides.ffmpeg === path.join(packagedBin, 'ffmpeg.exe'), opts.overrides.ffmpeg);
+
+    const stale = path.join(tmp, 'this-dir-does-not-exist');
+    core.writeSettings(userData, { enginesDir: stale });
+    const afterStale = liftMain(['isEngineFile', 'engineOptions'], deps).engineOptions();
+    report('stale configured dir falls back instead of breaking',
+      afterStale.overrides['yt-dlp'] === path.join(packagedBin, 'yt-dlp.exe'), afterStale.overrides['yt-dlp']);
+    report('isEngineFile returns nothing for a missing dir', lifted.isEngineFile(stale, 'yt-dlp') === '');
+
+    // 下载目录自愈：任务目录还没建出来时应当建好并放行，原来一律报"请选择有效的下载目录"
+    const wantedDir = path.join(tmp, 'Downloads', 'new-sub');
+    core.writeSettings(userData, { outputDir: path.join(tmp, 'Downloads'), enginesDir: '' });
+    const guard = liftMain(['validateTaskTarget'], {
+      path, fs, core,
+      DATA_DIR: () => userData,
+      LOGIN_SITES: core.LOGIN_SITES,
+    });
+    const task = {
+      url: 'https://www.youtube.com/watch?v=x1',
+      site: '',
+      outputDir: wantedDir,
+      mode: 'combined',
+      videoId: '137',
+      videoHasAudio: false,
+      audioId: '140',
+    };
+    const problem = guard.validateTaskTarget(task);
+    report('missing download dir is created instead of refusing the task',
+      problem === '' && fs.statSync(wantedDir).isDirectory(), problem || 'created');
+    report('task keeps the resolved absolute output dir',
+      path.resolve(task.outputDir) === path.resolve(wantedDir), task.outputDir);
+
+    const escapeTask = { ...task, outputDir: path.resolve(path.join(tmp, '..', '..', 'Windows', 'escape')) };
+    const escapeProblem = guard.validateTaskTarget(escapeTask);
+    report('output dir outside the download root is still refused',
+      escapeProblem !== '' && /根目录/.test(escapeProblem), escapeProblem);
+
+    // 根目录自己还没建出来时（用户在界面选了个子文件夹、之后手动删掉它），
+    // "目标 == 根"必须放行并把目录建回来；同级目录照样拒绝。
+    const missingRoot = path.join(tmp, 'Savedirs', 'gone');
+    const selfCreate = core.resolveContainedOutputDir(missingRoot, [missingRoot], { create: true });
+    report('output dir equal to a not-yet-created root is accepted',
+      selfCreate.ok === true && fs.statSync(missingRoot).isDirectory(), selfCreate.error || '');
+    const deep = path.join(missingRoot, 'a', 'b');
+    const deepOk = core.resolveContainedOutputDir(deep, [missingRoot], { create: true });
+    report('deep missing subdir under the root is created', deepOk.ok === true && fs.statSync(deep).isDirectory(), deepOk.error || '');
+    const outside = path.join(tmp, 'elsewhere-target');
+    const refused = core.resolveContainedOutputDir(outside, [missingRoot], { create: true });
+    report('sibling outside the root is still refused', refused.ok === false && refused.code === 'output_dir_outside_root', String(refused.code));
+    report('refused dir is not created behind the guard', !fs.existsSync(outside));
+
+    // 引擎升级的取址安全：只认官方域名与 https。域名表从主进程源码里读，
+    // 免得门和实现各写一份、改一边还是绿的。
+    const hostsLiteral = (main.match(/const UPDATE_HOSTS = new Set\(\[([\s\S]*?)\]\);/) || ['', ''])[1];
+    const allowedHosts = [...new Set([...hostsLiteral.matchAll(/'([^']+)'/g)].map((m) => m[1]))];
+    report('update host allowlist is read from main and not empty', allowedHosts.length >= 2, allowedHosts.join(','));
+    report('allowlist has no scheme-prefixed or wildcard entries',
+      allowedHosts.every((host) => !/[:*/]/.test(host)), allowedHosts.join(','));
+    const safety = liftMain(['allowlistedDownloadUrl', 'normalizeVersion'], { core, URL, UPDATE_HOSTS: new Set(allowedHosts) });
+    report('plain http asset url is refused', safety.allowlistedDownloadUrl('http://github.com/a/b.exe') === '');
+    report('off-site asset url is refused', safety.allowlistedDownloadUrl('https://evil.example.com/yt-dlp.exe') === '');
+    report('https github asset url is accepted',
+      safety.allowlistedDownloadUrl('https://github.com/yt-dlp/yt-dlp/releases/download/x/yt-dlp.exe') !== '');
+    report('relative url is refused', safety.allowlistedDownloadUrl('yt-dlp.exe') === '');
+    report('version tags compare without the leading v', safety.normalizeVersion('v1.31.14') === '1.31.14');
+
+    // 替换引擎文件：先删后改名，目标不存在时也要能装上
+    const place = liftMain(['placeEngineFile'], { path, fs, core });
+    const destFile = path.join(tmp, 'bin-dest', 'yt-dlp.exe');
+    core.ensureDirSync(path.dirname(destFile));
+    const newFile = path.join(tmp, 'staged.exe');
+    fs.writeFileSync(newFile, 'fresh');
+    const placed = place.placeEngineFile(newFile, destFile);
+    report('engine file lands at the destination', placed.ok === true && fs.readFileSync(destFile, 'utf8') === 'fresh');
+    report('staging file is consumed by the replace', !fs.existsSync(newFile));
+    fs.writeFileSync(newFile, 'second');
+    fs.writeFileSync(destFile + '.locked', 'x');
+    const replaceExisting = place.placeEngineFile(newFile, destFile);
+    report('replace over an existing engine works', replaceExisting.ok === true && fs.readFileSync(destFile, 'utf8') === 'second');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+sectionEngineDirs();
+
+// 8e) 取流 403 的归因：能解析、取不到流，不该指用户去登录一个公开视频
+const forbidden = core.classifyParseError('ERROR: unable to download video data: HTTP Error 403: Forbidden', null, 'yt-dlp');
+report('media 403 is not blamed on login', forbidden.kind === 'blocked_403', forbidden.kind);
+const forbiddenActions = (forbidden.remedies || []).map((item) => item.action);
+report('media 403 offers engine upgrade and a lower bitrate',
+  forbiddenActions.includes('update_engine') && forbiddenActions.includes('lower_quality'), forbiddenActions.join(','));
+const realLogin = core.classifyParseError('This video is private. Login required.', core.LOGIN_SITES.douyin, 'yt-dlp');
+report('a genuine login wall still says login', realLogin.kind === 'login_required', realLogin.kind);
+const proxyStillWins = core.classifyParseError('unable to connect to proxy: 407 tunnel failed', null, 'yt-dlp');
+report('proxy failure keeps its own class ahead of 403', proxyStillWins.kind === 'proxy', proxyStillWins.kind);
+report('403 class is printed the same way on every surface',
+  /blocked_403/.test(appJs) && /blocked_403/.test(agentTools));
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 process.exit(failures ? 1 : 0);

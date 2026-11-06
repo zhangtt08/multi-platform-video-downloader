@@ -608,6 +608,7 @@ const REASON_TEXT = {
   engine_missing: '本机没有可用的引擎（yt-dlp / gallery-dl）',
   login_required: '需要登录该站点',
   needs_login: '可能需要登录（站点拒绝了匿名请求）',
+  blocked_403: '链接解析成功但站点拒绝给出媒体流（403）：本机引擎版本落后或该档码率被风控，先升级引擎或降一档画质',
   site_changed: '站点改版或本机引擎版本落后',
   unsupported_site: '该站点没有对应的解析器',
   unsupported_url: '这不是具体内容页（首页/搜索页/用户页）',

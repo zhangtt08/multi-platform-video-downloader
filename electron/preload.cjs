@@ -33,6 +33,8 @@ contextBridge.exposeInMainWorld('qingying', {
   exportSiteCookies: (site, enabled) => invoke('auth:export', { site, enabled }),
 
   enginesProbe: () => invoke('engines:probe'),
+  enginesCheckUpdate: () => invoke('engines:check-update'),
+  enginesUpdate: () => invoke('engines:update'),
   chooseEnginesDir: () => invoke('engines:choose-dir'),
   sitesList: () => invoke('sites:list'),
 
@@ -50,6 +52,7 @@ contextBridge.exposeInMainWorld('qingying', {
 
   historyList: () => invoke('history:list'),
   historyClear: () => invoke('history:clear'),
+  removeHistoryItem: (id) => invoke('history:remove', { id }),
 
   chooseFolder: () => invoke('dialog:choose-folder'),
   openFolder: (folder) => invoke('folder:open', { folder }),
@@ -59,6 +62,7 @@ contextBridge.exposeInMainWorld('qingying', {
   onQueueChanged: (callback) => listener('queue:changed', callback),
   onAuthChanged: (callback) => listener('auth:changed', callback),
   onEnginesChanged: (callback) => listener('engines:changed', callback),
+  onHistoryChanged: (callback) => listener('history:changed', callback),
 
   windowControls: {
     minimize: () => invoke('window:minimize'),

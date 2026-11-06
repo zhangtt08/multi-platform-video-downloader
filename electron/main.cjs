@@ -1,6 +1,7 @@
 const { app, BrowserWindow, clipboard, dialog, ipcMain, net, screen, session, shell } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const core = require('./engine-core.cjs');
 const guard = require('./local-guard.cjs');
 const { startAgentApi, DEFAULT_API_PORT } = require('./agent-api.cjs');
@@ -63,6 +64,16 @@ function sendToMain(channel, payload) {
   }
 }
 
+// 历史的每一次落盘都要播给界面：「记录」页原本只在启动时读一次盘，于是下载完成后
+// 新记录看不到、被删的行和盘上的行对不上，用户只能重启程序才发现区别。
+function emitHistory() {
+  let items = [];
+  try {
+    items = core.readHistory(DATA_DIR());
+  } catch {}
+  sendToMain('history:changed', { items });
+}
+
 function createWindow() {
   const workArea = screen.getPrimaryDisplay().workAreaSize;
   const width = Math.max(760, Math.min(1180, workArea.width - 32));
@@ -102,21 +113,34 @@ function createWindow() {
 }
 
 // ── 引擎位置 ──────────────────────────────────────────────────────────────
+function isEngineFile(dir, name) {
+  if (!dir) return '';
+  const file = path.join(dir, name + '.exe');
+  try {
+    return fs.statSync(file).isFile() ? file : '';
+  } catch {
+    return '';
+  }
+}
+
 function engineOptions() {
   const overrides = {};
   const roots = [];
+  // 用户在设置里指定的引擎目录（例如安装包里的 resources/bin）。
+  const configured = core.readSettings(DATA_DIR()).enginesDir;
   if (app.isPackaged) {
     const bin = path.join(process.resourcesPath, 'bin');
-    overrides['yt-dlp'] = path.join(bin, 'yt-dlp.exe');
-    overrides['gallery-dl'] = path.join(bin, 'gallery-dl.exe');
-    overrides['ffmpeg'] = path.join(bin, 'ffmpeg.exe');
+    for (const name of ['yt-dlp', 'gallery-dl', 'ffmpeg']) {
+      // 设置目录里有这个引擎时，它优先于自带副本。原来打包版永远先用自带的，
+      // 于是"升级引擎"（应用内更新或自己换 exe）在打包版里根本不生效——
+      // 站点改版后只能等作者重新出包。缺哪个就退回自带的哪个，不猜。
+      overrides[name] = isEngineFile(configured, name) || path.join(bin, name + '.exe');
+    }
   } else {
+    if (configured) roots.push(configured);
     roots.push(path.join(app.getAppPath(), 'resources', 'bin'));
     roots.push(path.join(app.getAppPath(), 'resources'));
   }
-  // 用户在设置里指定的引擎目录（例如安装包里的 resources/bin）。
-  const configured = core.readSettings(DATA_DIR()).enginesDir;
-  if (configured) roots.unshift(configured);
   return { overrides, extraRoots: roots };
 }
 
@@ -130,13 +154,222 @@ function ffmpegLocation() {
   return 'ffmpeg';
 }
 
+let enginesProbedAt = 0;
 async function probeEngines() {
+  // 探测要 fork 3 个子进程（各自超时上限 15s）：渲染层 bootstrap 一定会调它，
+  // 与启动时的探测撞在一起就是白 fork 一轮。60 秒内的结果直接复用——
+  // 手动"重新探测"通常在升级完引擎几分钟后，不会被这层缓存挡住。
+  if (enginesCache && Date.now() - enginesProbedAt < 60 * 1000) return enginesCache;
   enginesCache = await core.probeEngines(engineOptions());
   // 如实交代"设置里的引擎目录还在不在"——用户搬过安装包时，这是唯一能解释
   // 为什么 gallery-dl / ffmpeg 报未安装的原因。
   enginesCache.engines_dir = core.enginesDirStatus(core.readSettings(DATA_DIR()).enginesDir);
+  enginesProbedAt = Date.now();
   return enginesCache;
 }
+
+// ── 引擎升级（只有界面按钮能触发，不开放给本机接口）────────────────────────
+// 站点改版是常态：YouTube 从 2026-10 起对旧版 yt-dlp 的播放器客户端直接回 403
+// ——链接解析得出来，媒体流取不到。与其让用户去学命令行，不如给一个检查更新的入口。
+// 下载来的东西一律当不可信处理：只认官方仓库的 release 资产、只走 https、限 80 MB、
+// 必须与 GitHub API 公布的 sha256 完全一致，校验通过才替换本机文件。
+const ENGINE_SOURCES = {
+  'yt-dlp': { repo: 'yt-dlp/yt-dlp', asset: 'yt-dlp.exe' },
+  'gallery-dl': { repo: 'mikf/gallery-dl', asset: 'gallery-dl.exe' },
+};
+const UPDATE_HOSTS = new Set([
+  'api.github.com',
+  'github.com',
+  'objects.githubusercontent.com',
+  'release-assets.githubusercontent.com',
+]);
+const UPDATE_MAX_BYTES = 80 * 1024 * 1024;
+
+function enginesUpdateDir() {
+  const dir = path.join(DATA_DIR(), 'engines');
+  core.ensureDirSync(dir);
+  return dir;
+}
+
+function allowlistedDownloadUrl(raw) {
+  let parsed;
+  try {
+    parsed = new URL(core.safeText(raw, 2048));
+  } catch {
+    return '';
+  }
+  return parsed.protocol === 'https:' && UPDATE_HOSTS.has(parsed.hostname) ? parsed.toString() : '';
+}
+
+function normalizeVersion(value) {
+  return core.safeText(value, 40).trim().replace(/^v/i, '');
+}
+
+async function fetchReleaseMeta(name) {
+  const source = ENGINE_SOURCES[name];
+  if (!source) return { ok: false, error: `${name} 没有登记官方发布源，不在应用内升级。` };
+  let meta;
+  try {
+    const response = await net.fetch(`https://api.github.com/repos/${source.repo}/releases/latest`, {
+      headers: { 'User-Agent': 'qingying-downloader', Accept: 'application/vnd.github+json' },
+    });
+    if (!response.ok) return { ok: false, error: `${source.repo} 的发布信息返回 ${response.status}，稍后再试。` };
+    meta = await response.json();
+  } catch (error) {
+    return {
+      ok: false,
+      error: `取不到 ${source.repo} 的发布信息：${core.safeText(error && error.message, 200)}。本机走代理时请先确认代理可用。`,
+    };
+  }
+  const asset = (Array.isArray(meta.assets) ? meta.assets : []).find((item) => item && item.name === source.asset);
+  if (!asset) return { ok: false, error: `最新发布里没有 ${source.asset} 这个文件，不动本机引擎。` };
+  const downloadUrl = allowlistedDownloadUrl(asset.browser_download_url);
+  if (!downloadUrl) {
+    return { ok: false, error: `下载地址不在允许的官方域名内，已拒绝：${core.safeText(asset.browser_download_url, 200)}` };
+  }
+  const rawDigest = core.safeText(asset.digest, 80).trim();
+  if (!/^sha256:[0-9a-f]{64}$/i.test(rawDigest)) {
+    return { ok: false, error: `官方发布没给出 ${source.asset} 的 sha256，无法校验，已拒绝下载。` };
+  }
+  return {
+    ok: true,
+    name,
+    version: normalizeVersion(meta.tag_name),
+    assetName: source.asset,
+    downloadUrl,
+    declaredBytes: Number(asset.size) || 0,
+    sha256: rawDigest.slice(7).toLowerCase(),
+  };
+}
+
+// 取回来先落 .download 临时名，校验通过才改名进位：坏文件不会顶替好引擎。
+async function downloadVerifiedEngine(meta, destFile) {
+  let response;
+  try {
+    response = await net.fetch(meta.downloadUrl, {
+      headers: { 'User-Agent': 'qingying-downloader' },
+      redirect: 'follow',
+    });
+  } catch (error) {
+    return { ok: false, error: `下载 ${meta.assetName} 失败：${core.safeText(error && error.message, 200)}` };
+  }
+  if (!response.ok || !response.body) {
+    return { ok: false, error: `下载 ${meta.assetName} 返回 ${response.status}，没有写入本机。` };
+  }
+  const tmpFile = `${destFile}.download`;
+  const reader = response.body.getReader();
+  const hash = crypto.createHash('sha256');
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const piece = Buffer.from(value);
+    total += piece.length;
+    if (total > UPDATE_MAX_BYTES) {
+      try {
+        await reader.cancel();
+      } catch {}
+      fs.rmSync(tmpFile, { force: true });
+      return { ok: false, error: `下载超过 ${Math.round(UPDATE_MAX_BYTES / 1024 / 1024)} MB 上限，已中止并删除临时文件。` };
+    }
+    hash.update(piece);
+    chunks.push(piece);
+  }
+  const actual = hash.digest('hex');
+  if (actual !== meta.sha256) {
+    fs.rmSync(tmpFile, { force: true });
+    return {
+      ok: false,
+      error: `sha256 校验不一致（期望 ${meta.sha256.slice(0, 12)}…，实际 ${actual.slice(0, 12)}…），已删除下载的文件，没有替换本机引擎。`,
+    };
+  }
+  if (meta.declaredBytes && Math.abs(meta.declaredBytes - total) > 1024) {
+    fs.rmSync(tmpFile, { force: true });
+    return { ok: false, error: `下载字节数与官方声明不符（${total} / ${meta.declaredBytes}），已删除。` };
+  }
+  await fs.promises.writeFile(tmpFile, Buffer.concat(chunks));
+  return { ok: true, tmpFile, bytes: total };
+}
+
+function placeEngineFile(tmpFile, destFile) {
+  // Windows 不允许覆盖正在运行的 exe，所以先删再改名；删不掉就是引擎正被占用。
+  try {
+    fs.rmSync(destFile, { force: true });
+  } catch (error) {
+    const code = core.safeText(error && error.code, 40);
+    fs.rmSync(tmpFile, { force: true });
+    return {
+      ok: false,
+      error: `本机 ${path.basename(destFile)} 正在被使用（${code || 'EPERM'}），替换失败。请先停掉正在下载的任务再更新引擎。`,
+    };
+  }
+  try {
+    fs.renameSync(tmpFile, destFile);
+  } catch (error) {
+    fs.rmSync(tmpFile, { force: true });
+    return { ok: false, error: `写入 ${path.basename(destFile)} 失败：${core.safeText(error && error.message, 200)}` };
+  }
+  return { ok: true };
+}
+
+async function updateOneEngine(name, installedVersion) {
+  const meta = await fetchReleaseMeta(name);
+  if (!meta.ok) return meta;
+  const destFile = path.join(enginesUpdateDir(), meta.assetName);
+  if (installedVersion && normalizeVersion(installedVersion) === meta.version) {
+    return { ok: true, name, version: meta.version, unchanged: true, path: destFile };
+  }
+  const downloaded = await downloadVerifiedEngine(meta, destFile);
+  if (!downloaded.ok) return { ...downloaded, name };
+  const placed = placeEngineFile(downloaded.tmpFile, destFile);
+  if (!placed.ok) return { ...placed, name };
+  return { ok: true, name, version: meta.version, from: installedVersion || '', bytes: downloaded.bytes, path: destFile };
+}
+
+ipcMain.handle('engines:check-update', async () => {
+  const current = enginesCache || (await probeEngines());
+  const records = { 'yt-dlp': current.yt_dlp, 'gallery-dl': current.gallery_dl };
+  const items = [];
+  for (const name of Object.keys(ENGINE_SOURCES)) {
+    const meta = await fetchReleaseMeta(name);
+    const installed = records[name] || {};
+    if (!meta.ok) {
+      items.push({ name, installed: installed.version || '', latest: '', needs_update: false, error: meta.error });
+      continue;
+    }
+    items.push({
+      name,
+      installed: installed.version || '',
+      latest: meta.version,
+      needs_update: normalizeVersion(installed.version) !== meta.version,
+      asset_bytes: meta.declaredBytes,
+      error: '',
+    });
+  }
+  return { ok: true, items };
+});
+
+ipcMain.handle('engines:update', async () => {
+  const current = enginesCache || (await probeEngines());
+  const records = { 'yt-dlp': current.yt_dlp, 'gallery-dl': current.gallery_dl };
+  const results = [];
+  for (const name of Object.keys(ENGINE_SOURCES)) {
+    results.push(await updateOneEngine(name, (records[name] || {}).version));
+  }
+  const installedSomething = results.some((item) => item.ok && !item.unchanged);
+  if (results.some((item) => item.ok)) {
+    // 升级目录一旦有可用的引擎，就把它指成设置里的引擎目录：
+    // 上面 engineOptions 的优先级修好了，打包版才会真的用这份新的而不是自带的旧副本。
+    core.writeSettings(DATA_DIR(), { enginesDir: enginesUpdateDir() });
+  }
+  if (installedSomething) {
+    enginesProbedAt = 0;
+    enginesCache = null;
+  }
+  const refreshed = await probeEngines();
+  return { ok: !results.some((item) => !item.ok), results, engines: refreshed };
+});
 
 // ── 登录态：Cookie 只在进程内出现，落盘的只有状态摘要 ───────────────────────
 async function siteCookies(site) {
@@ -402,12 +635,24 @@ function validateTaskTarget(task) {
   if (!core.isHttpUrl(task.url)) return '网址无效。';
   const site = task.site ? LOGIN_SITES[task.site] : null;
   if (site && !core.isSiteUrl(task.url, site)) return '网址与所选站点不匹配。';
+  let dirReady = false;
   try {
-    if (!path.isAbsolute(task.outputDir) || !fs.statSync(task.outputDir).isDirectory()) {
-      return '请选择有效的下载目录。';
-    }
+    dirReady = path.isAbsolute(task.outputDir) && fs.statSync(task.outputDir).isDirectory();
   } catch {
-    return '请选择有效的下载目录。';
+    dirReady = false;
+  }
+  if (!dirReady) {
+    // 目录常常是"保存位置"下面一个还没建出来的子文件夹（或用户手动删过它）。
+    // 原来直接判失败，报"请选择有效的下载目录"——用户看着目录框里的路径完全没错，
+    // 却每条任务都失败，这就是"下载都不行了"最难自查的那一种。
+    // 建目录仍走下载根判定：根外的路径照样拒绝，不会因为它就把任务写到别处。
+    const created = core.resolveContainedOutputDir(
+      task.outputDir,
+      core.downloadRoots(core.readSettings(DATA_DIR())),
+      { create: true },
+    );
+    if (!created.ok) return created.error || '请选择有效的下载目录。';
+    task.outputDir = created.resolved || created.real || task.outputDir;
   }
   if (task.mode !== 'images' && task.mode !== 'audio' && !task.videoId) return '请选择视频画质。';
   if (task.mode === 'audio' && !task.audioId) return '请选择音频轨道。';
@@ -632,6 +877,7 @@ function recordHistory(task) {
       attempts: task.attempts,
       finished_at: task.finished_at,
     });
+    emitHistory();
   } catch {}
 }
 
@@ -786,8 +1032,14 @@ ipcMain.handle('template:preview', (_event, payload) => {
 });
 
 ipcMain.handle('history:list', () => ({ items: core.readHistory(DATA_DIR()) }));
+ipcMain.handle('history:remove', (_event, payload) => {
+  const removed = core.removeHistoryItem(DATA_DIR(), core.safeText(payload?.id, 40));
+  if (removed) emitHistory();
+  return removed;
+});
 ipcMain.handle('history:clear', () => {
   core.clearHistory(DATA_DIR());
+  emitHistory();
   return { items: [] };
 });
 
@@ -855,7 +1107,9 @@ ipcMain.handle('queue:remove', (_event, payload) => {
 });
 
 ipcMain.handle('queue:clear-finished', () => {
-  const finished = taskOrder.filter((id) => ['done', 'cancelled'].includes(tasks.get(id)?.status));
+  // failed 也算"已结束"：一键清除原来只收 done/cancelled，失败的行删不掉，
+  // 只能一条条留在列表里（用户说的"没有删除功能"多半就落在这里）。
+  const finished = taskOrder.filter((id) => ['done', 'cancelled', 'failed'].includes(tasks.get(id)?.status));
   for (const id of finished) {
     tasks.delete(id);
     const index = taskOrder.indexOf(id);
@@ -981,8 +1235,15 @@ function downloadThroughQueue(payload) {
   const task = makeTask(payload || {});
   pumpQueue();
   return new Promise((resolve) => {
+    // 只在这个任务真的有变化时才广播快照：等重试倒计时/长时间无进展时，
+    // 之前每 400ms 都全量序列化整个队列推一遍，纯空转。
+    let lastSignature = '';
     const poll = setInterval(() => {
-      emitQueue();
+      const signature = JSON.stringify(taskView(task));
+      if (signature !== lastSignature) {
+        lastSignature = signature;
+        emitQueue();
+      }
       if (!FINISHED_STATUSES.has(task.status)) return;
       clearInterval(poll);
       resolve({

@@ -364,7 +364,9 @@ function runTool(executable, args, options) {
       return;
     }
 
-    let stdout = '';
+    // stdout 收集进 chunk 数组最后 concat：字符串 += 是 O(n²) 拷贝，
+    // 大播放列表的 --dump-single-json（可达几十 MB）时明显。
+    const stdoutChunks = [];
     let stderr = '';
     let stdoutBytes = 0;
     let finished = false;
@@ -390,13 +392,14 @@ function runTool(executable, args, options) {
         terminateProcessTree(child);
         return;
       }
-      stdout += chunk.toString('utf8');
+      stdoutChunks.push(chunk);
     });
     child.stderr.on('data', (chunk) => {
       stderr = appendTail(stderr, chunk.toString('utf8'));
     });
     child.once('error', (error) => finish(() => reject(normalizeSpawnError(error, executable))));
     child.once('close', (code) => finish(() => {
+      const stdout = Buffer.concat(stdoutChunks).toString('utf8');
       if (timedOut) {
         reject(new EngineError('timeout', '连接超时，请检查网络后重试。'));
       } else if (outputTooLarge) {
@@ -486,8 +489,11 @@ async function probeEngine(name, options) {
     return { name, available: false, version: '', path: '', source: 'not_found', error: '未安装，或不在搜索到的位置内' };
   }
   try {
+    // 15s 在这里不够：yt-dlp 是 23MB 的 PyInstaller 单文件，换过版本后第一次执行要等
+    // 杀毒软件扫完，本机实测冷启动 34.5s / 14.6s / 7.2s 递减。旧预算下冷启动会被判成
+    // "引擎不可用"，界面于是拒绝一切下载——和"下载坏了"是同一个观感。
     const { stdout } = await runTool(resolved.path, VERSION_ARGS[name] || ['--version'], {
-      timeoutMs: (options && options.probeTimeoutMs) || 15000,
+      timeoutMs: (options && options.probeTimeoutMs) || 40000,
     });
     return { name, available: true, version: extractVersion(name, stdout), path: resolved.path, source: resolved.source, error: '' };
   } catch (error) {
@@ -1131,6 +1137,10 @@ const PROXY_PATTERNS = /\b(proxy|proxies|407|tunnel)\b|certificate|x509|self[- ]
 const RATE_PATTERNS = /\b(too many|429|rate limit|slow down|blocked|flood)\b/i;
 const SITE_CHANGED_PATTERNS = /please report this issue|unable to extract|could not find .* (?:in|on) |extractor (?:error|failed)|unsupported url.*extractor/i;
 const LINK_GONE_PATTERNS = /http error 40[49]|http error 410|\bnot found\b|video unavailable|private video|内容已被删除|链接已失效/i;
+// 取流阶段（不是解析阶段）被站点拒绝：链接已经抽出来了，是媒体直链本身回 403。
+// 2026-10 实测：YouTube 对旧版 yt-dlp 的播放器客户端在这种形态下先跑到几个百分点再 403，
+// 归成"需要登录"会把用户引去登录一个根本不需要登录的公开视频。
+const MEDIA_403_PATTERNS = /unable to download (?:video|audio)\s*data|got status code 403|http error 403.*(?:fragment|download)/i;
 const LOGIN_HINTS_CN = ['登录', '风控', '验证', '权限', '会员'];
 const NETWORK_HINTS_CN = ['超时', '连接', '网络', '代理'];
 
@@ -1150,6 +1160,14 @@ function classifyParseError(message, site, engineName) {
   } else if (RATE_PATTERNS.test(lowered) || lowered.includes('限流')) {
     kind = 'rate_limited';
     remedies.push({ action: 'wait_retry', label: '稍后重试', detail: '站点在限流，一般等 1-3 分钟再解析同一链接；期间不要连续重试，那只会延长被限流的时间。' });
+  } else if (MEDIA_403_PATTERNS.test(lowered)) {
+    kind = 'blocked_403';
+    remedies.push({ action: 'update_engine', label: '升级引擎后重试', detail: '链接解析是成功的，卡在站点拒绝给出媒体流（403）。站点改版后，旧版 yt-dlp 的播放器客户端最常出现这种"能解析、取流被拒"；先在"本机引擎"里点检查更新，升级完再重试。' });
+    remedies.push({ action: 'lower_quality', label: '换低一档画质', detail: '高码率档（4K / AV1）最容易被风控。退一档（1080p 或 720p）常能直接下下来。' });
+    if (site) {
+      remedies.push({ action: 'reparse', label: '重新解析一次', detail: site.label + ' 的直链是网页现签的，放一会儿就过期；重新解析会拿到一批新链接。' });
+    }
+    remedies.push({ action: 'retry', label: '换个网络或代理后重试', detail: '同一个出口 IP 连续被拒时，换线路比反复重试有效——重试只会让风控记时更久。' });
   } else if (LOGIN_PATTERNS.test(lowered) || LOGIN_HINTS_CN.some((hint) => text.includes(hint))) {
     kind = site ? 'login_required' : 'needs_login';
     const blocked = /http error 40[13]|forbidden|bot confirm|cloudflare/i.test(lowered);
@@ -1801,37 +1819,50 @@ async function runImageListDownload(spec, hooks) {
   const files = [];
   let bytes = 0;
 
-  for (const image of images) {
-    if (state.cancelled) return { ok: false, cancelled: true, paused: state.paused, files, bytes };
-    const url = safeText(image && image.url, 4096).trim();
-    if (!isHttpUrl(url)) continue;
-    if (typeof h.onProgress === 'function') {
-      h.onProgress({
-        type: 'progress',
-        percent: Math.round((files.length / images.length) * 100) + '%',
-        speed: '',
-        eta: '第 ' + (files.length + 1) + '/' + images.length + ' 张',
-      });
+  // 原来逐张 await：300 张图一张等一张。并发 4 路下载；取消与失败语义不变
+  // （任一张失败立即收手返回），文件名仍按"已成功张数"连续编号。
+  const IMAGE_CONCURRENCY = 4;
+  let cursor = 0;
+  let failure = null;
+  const runOne = async () => {
+    while (cursor < images.length) {
+      if (state.cancelled || failure) return;
+      const image = images[cursor++];
+      const url = safeText(image && image.url, 4096).trim();
+      if (!isHttpUrl(url)) continue;
+      if (typeof h.onProgress === 'function') {
+        h.onProgress({
+          type: 'progress',
+          percent: Math.round((files.length / images.length) * 100) + '%',
+          speed: '',
+          eta: '第 ' + (files.length + 1) + '/' + images.length + ' 张',
+        });
+      }
+      try {
+        const buffer = await fetchBuffer(url, headers, 0, 100 * 1024 * 1024);
+        if (!buffer.length) throw new Error('图片内容为空');
+        const ext = safeExt(image.ext) || 'jpg';
+        const fileName = baseName + '-' + String(files.length + 1).padStart(2, '0');
+        const dest = uniquePath(targetDir, fileName, ext);
+        await fs.promises.writeFile(dest, buffer);
+        files.push({ path: dest, bytes: buffer.length, mtimeMs: Date.now() });
+        bytes += buffer.length;
+      } catch (error) {
+        if (!failure) failure = error;
+        return;
+      }
     }
-    try {
-      const buffer = await fetchBuffer(url, headers, 0, 100 * 1024 * 1024);
-      if (!buffer.length) throw new Error('图片内容为空');
-      const ext = safeExt(image.ext) || 'jpg';
-      const fileName = baseName + '-' + String(files.length + 1).padStart(2, '0');
-      const dest = uniquePath(targetDir, fileName, ext);
-      await fs.promises.writeFile(dest, buffer);
-      files.push({ path: dest, bytes: buffer.length, mtimeMs: Date.now() });
-      bytes += buffer.length;
-    } catch (error) {
-      if (state.cancelled) return { ok: false, cancelled: true, paused: state.paused, files, bytes };
-      return {
-        ok: false,
-        error: '第 ' + (files.length + 1) + ' 张图片下载失败：' + safeText(error.message, 200),
-        kind: 'network',
-        files,
-        bytes,
-      };
-    }
+  };
+  await Promise.all(Array.from({ length: Math.min(IMAGE_CONCURRENCY, images.length) }, runOne));
+  if (state.cancelled) return { ok: false, cancelled: true, paused: state.paused, files, bytes };
+  if (failure) {
+    return {
+      ok: false,
+      error: '第 ' + (files.length + 1) + ' 张图片下载失败：' + safeText(failure.message, 200),
+      kind: 'network',
+      files,
+      bytes,
+    };
   }
   if (!files.length) return { ok: false, error: '没有成功保存任何图片。', kind: 'no_formats', files, bytes, started_at: new Date(startedAt).toISOString() };
   return { ok: true, engine: '内置取图器', files, bytes };
@@ -1908,9 +1939,29 @@ function writeJsonFile(file, value) {
   return value;
 }
 
+// 设置文件很小但读得极频繁（下载期间每次队列快照要读 3-4 次，160ms 一拍 ≈ 每秒
+// 25 次同步读盘+JSON 解析）。按 mtime 做进程内缓存；写入后清缓存，下一次读重新落盘。
+const settingsCache = new Map(); // root -> { mtimeMs, value }
+
 function readSettings(root) {
-  const stored = readJsonFile(dataPaths(root).settings, {});
-  return readSettingsFromValue(stored);
+  const file = dataPaths(root).settings;
+  let mtimeMs = 0;
+  try {
+    mtimeMs = fs.statSync(file).mtimeMs;
+  } catch {}
+  const hit = settingsCache.get(root);
+  if (hit && hit.mtimeMs === mtimeMs) {
+    // 返回浅副本 + 数组副本：调用方改返回值不能污染缓存
+    return { ...hit.value, allowedOutputRoots: [...hit.value.allowedOutputRoots] };
+  }
+  const stored = readJsonFile(file, {});
+  const value = readSettingsFromValue(stored);
+  settingsCache.set(root, { mtimeMs, value });
+  if (settingsCache.size > 8) {
+    const oldest = settingsCache.keys().next().value;
+    if (oldest !== undefined) settingsCache.delete(oldest);
+  }
+  return { ...value, allowedOutputRoots: [...value.allowedOutputRoots] };
 }
 
 function writeSettings(root, patch) {
@@ -1920,6 +1971,7 @@ function writeSettings(root, patch) {
   const storable = {};
   for (const key of Object.keys(DEFAULT_SETTINGS)) storable[key] = merged[key];
   writeJsonFile(dataPaths(root).settings, storable);
+  settingsCache.delete(root);
   return merged;
 }
 
@@ -2058,10 +2110,10 @@ function resolveContainedOutputDir(candidate, roots, options) {
   if (!projected) {
     return { ok: false, code: 'output_dir_unreachable', resolved: target, root: '', error: '下载目录连最近的上级目录都读不出来：' + target + '。请先在界面里指定一个真实存在的下载根目录。' };
   }
-  // create:true（Agent 工具显式要求"允许创建"）时，目标可能还不存在：按最近的已存在上级判归属，
-  // 与 mkdir 的语义一致；否则"下载根目录下还没建出来的子目录"会被误判成越界。
-  const containmentTarget = opts.create && !fs.existsSync(target) ? (projectRealPath(path.dirname(target), impl) || projected) : projected;
-  const hit = realRoots.find((entry) => pathIsInside(entry.real, containmentTarget));
+  // projectRealPath 已经会把"还不存在的末级"投影到最近已存在上级之下，所以 create 也直接用它：
+  // 原来另算一份"上级投影"，于是"下载目录恰好就是那个还没建出来的根"（用户在界面里选了
+  // 一个子文件夹、之后又手动删掉它）被判成越界，报出"根目录就是它自己却不许写"的自相矛盾。
+  const hit = realRoots.find((entry) => pathIsInside(entry.real, projected));
   if (!hit) {
     return {
       ok: false,
@@ -2158,6 +2210,18 @@ function appendHistory(root, entry) {
 
 function clearHistory(root) {
   writeJsonFile(dataPaths(root).history, { items: [], limit: HISTORY_LIMIT });
+  return true;
+}
+
+// 单条删除记录：只按 id 精确匹配删掉一条，删不掉就如实返回 false（界面上的"删除"
+// 按钮不能假装成功——行还在，用户会以为程序没反应）。
+function removeHistoryItem(root, id) {
+  const want = safeText(id, 40);
+  if (!want) return false;
+  const items = readHistory(root);
+  const next = items.filter((item) => safeText(item && item.id, 40) !== want);
+  if (next.length === items.length) return false;
+  writeJsonFile(dataPaths(root).history, { items: next, limit: HISTORY_LIMIT });
   return true;
 }
 
@@ -2307,6 +2371,7 @@ module.exports = {
   readHistory,
   appendHistory,
   clearHistory,
+  removeHistoryItem,
   readAuthState,
   writeAuthState,
   authStateForSite,

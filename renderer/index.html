@@ -292,7 +292,7 @@
               <button class="filter-tab" type="button" role="tab" aria-selected="false" data-queue-filter="active">未完成</button>
               <button class="filter-tab" type="button" role="tab" aria-selected="false" data-queue-filter="done">已完成</button>
             </div>
-            <button id="clear-finished" class="text-button" type="button">清除已完成</button>
+            <button id="clear-finished" class="text-button" type="button">清除已结束（含失败）</button>
           </div>
 
           <ul id="task-list" class="task-list" aria-live="polite"></ul>
@@ -378,12 +378,14 @@
                   <p>本机的视频、图集与转码能力。</p>
                 </div>
                 <button id="probe-engines" class="mini-button" type="button">重新探测</button>
+                <button id="update-engines" class="mini-button" type="button" title="向官方发布页确认版本，并把新版引擎下载到本机">检查更新引擎</button>
               </div>
 
               <ul id="engine-list" class="engine-list" aria-live="polite">
                 <li class="engine-row"><span>正在探测…</span></li>
               </ul>
               <p id="engine-note" class="side-note"></p>
+              <p id="engine-update-note" class="side-note" aria-live="polite"></p>
               <div class="side-panel-foot">
                 <button id="choose-engines-dir" class="mini-button ghost" type="button">指定引擎目录</button>
                 <span id="engine-dir-note" class="side-note"></span>

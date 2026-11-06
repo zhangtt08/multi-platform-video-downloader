@@ -24,6 +24,18 @@
 
 ---
 
+## 🆕 What's new in v1.6.1 (2026-10-30)
+
+- **YouTube downloads fixed (HTTP 403)**: the bundled yt-dlp `2026.07.04` is treated by YouTube as an outdated client — metadata still resolves, but every media request returns 403. The bundled engine is now the official `2026.10.26` (sha256 matches the release's `SHA2-256SUMS` byte for byte); the same 4K link now downloads.
+- **Packaged builds prefer the bundled engines**: a stale "engine folder" setting pointing at a deleted path no longer leaves the app without a usable CLI.
+- **In-app engine updates**: Settings → *Check for updates* queries the official release page, downloads, verifies sha256, replaces atomically and re-probes. Only `https` on the official hosts is accepted.
+- **403 is no longer reported as "login required"** — it is classified as blocked by the site, with remedies to upgrade the engine, pick a lower quality, or retry.
+- **The download lists can actually be deleted from**: queue rows and history rows carry a visible delete button (not only a menu entry), *Clear finished* covers failed rows too, and deleting a record never touches downloaded files.
+- **The history view refreshes live**: it used to read the file once at startup, so a finished download only appeared after a restart.
+- **A missing download folder is created** instead of being rejected as "outside the root".
+
+---
+
 ## 🆕 What's new in v1.6.0 (2026-10-29)
 
 - **Douyin fixed** (issue #1): Douyin's detail API requires a signature computed by the page itself, which no CLI can reproduce (`Fresh cookies`). The app now resolves the post inside the logged-in in-app browser and hands the signed direct URLs to yt-dlp — progress, resume and retries stay intact.

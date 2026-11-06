@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-Windows 桌面视频/图片下载器（Electron 壳 + yt-dlp / gallery-dl 双引擎），v1.4.0。本仓库为应用源码（`C:\software\QingYingDownloader` 打包版的 asar 源），配套工具（yt-dlp / gallery-dl / ffmpeg）随打包版内置。
+Windows 桌面视频/图片下载器（Electron 壳 + yt-dlp / gallery-dl 双引擎），v1.6.1。本仓库即应用源码，配套工具（yt-dlp / gallery-dl / ffmpeg）随打包版内置在 `resources/bin`。
 
 ## 功能特性
 
@@ -14,44 +14,54 @@ Windows 桌面视频/图片下载器（Electron 壳 + yt-dlp / gallery-dl 双引
 - 图片落盘使用 Node 原生 https（绕开 Electron net.fetch 挂死问题）
 - 下载队列与进度展示
 
-## 版本锁定（勿随意升级）
+## 引擎版本
 
-| 工具 | 版本 | 原因 |
+| 工具 | 版本 | 说明 |
 |---|---|---|
-| yt-dlp | 2026.07.04 | 2026.08.19 版实测破坏 TikTok 解析且修不好 B站 412 |
+| yt-dlp | 2026.10.26 | 内置版。2026.07.04 已被 YouTube 判为旧客户端（媒体流全 403）；2026.08.19 曾破坏 TikTok 解析。当前这版实测：YouTube 4K 链接可下载、抖音走应用内浏览器链路可下载（2026-10-30 回归）。B站匿名请求在本机被站点 412 拦下（与本版本无关的站点风控），应用内 B站 请登录后再试。 |
 | gallery-dl | 1.31.10 | 新版 release 不再附 exe |
 | ffmpeg | 6.1.1 | 复用打包版自带 |
+
+设置页「检查更新」会去官方发布页比对版本，只接受 `https` + 官方域名，校验 sha256 后原子替换 `resources/bin` 里的引擎 —— 站点改版不必等重新发版。冷启动预算按 40s 计（yt-dlp 换版后第一次执行要等杀毒扫描，本机实测 34.5s），避免把冷启动误判成"引擎不可用"。
 
 ## 源码结构
 
 ```
-electron/main.cjs      主进程：引擎调度、格式解析、下载队列、Cookie 注入
-electron/preload.cjs   预加载桥
-renderer/              界面（index.html / app.js / styles.css / 图标）
+electron/main.cjs        主进程：窗口、下载队列、历史、登录窗口、引擎升级
+electron/engine-core.cjs 引擎核心：探测 / 解析 / 下载 / 失败归因 / 历史存储（界面与 Agent API 共用）
+electron/preload.cjs     预加载桥（IPC 白名单）
+electron/agent-api.cjs   应用内本机接口（127.0.0.1:8392）
+electron/local-guard.cjs 本机接口守卫（令牌 + 来源 + 下载根）
+electron/douyin-browser.cjs 抖音：应用内浏览器取数与签名直链
+renderer/                界面（index.html / app.js / styles.css / 图标）
+agent/                   无头 Agent 服务（8793）与 MCP stdio 桥
+resources/bin/           内置引擎 exe（引擎不进 git）
+scripts/                 构建、验收、变异台、界面验收
 ```
 
 ## 运行（源码方式，Windows）
 
-> 本仓库为打包版的 asar 提取源码；若只想下载文件，直接使用打包版即可（工具已内置在 `resources/bin/`）。
-
 ```powershell
-npm install --save-dev electron ffmpeg-static
-# 将锁定版本的工具放到应用查找的位置：
-#   yt-dlp.exe     -> resources/yt-dlp.exe（或加入 PATH）
-#   gallery-dl.exe -> resources/bin/gallery-dl.exe（或加入 PATH）
-npx electron .
+npm install
+# 把 yt-dlp.exe / gallery-dl.exe / ffmpeg.exe 放进 resources/bin（打包版已内置）
+npm start
 ```
 
-打包版从可执行文件旁的 `resources/bin/*.exe` 解析工具路径。
-
-## 修改与打包方式
-
-打包版无构建链，采用 asar 往返：
+## 构建与打包
 
 ```powershell
-npx asar extract C:\software\QingYingDownloader\resources\app.asar QingYingDownloader_src
-# 修改源码后 node --check 校验
-npx asar pack QingYingDownloader_src C:\software\QingYingDownloader\resources\app.asar
+npm run build   # dist/app.asar + dist/win-unpacked（win-unpacked\清影下载器.exe 可直接双击）
+npm run dist    # 另出 NSIS 安装包
+# 部署到已有的打包目录：把 dist/app.asar 覆盖到 <打包目录>\resources\app.asar，引擎放 <打包目录>\resources\bin
+```
+
+## 验收
+
+```powershell
+npm run check        # 静态 + 行为门（引擎优先级、目录自愈、403 归因、历史删除与刷新、升级取址）
+npm run check:api    # 本机接口守卫（令牌、跨源、下载根）
+npm run check:mutate # 变异台：把每处修复逐个退回，确认对应的门真的会红
+npm run ui:verify    # 真实界面验收：先以 --remote-debugging-port=9345 启动打包版
 ```
 
 ## 许可证

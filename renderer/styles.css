@@ -391,6 +391,12 @@ textarea:focus-visible {
   background: #dceaff;
 }
 
+/* 删除：常态是灰的（不抢主操作），hover 才转红 —— 红色留给"要动手了"这一刻。 */
+.icon-button.danger:hover {
+  color: #fff;
+  background: var(--danger);
+}
+
 .fab {
   display: grid;
   width: 46px;

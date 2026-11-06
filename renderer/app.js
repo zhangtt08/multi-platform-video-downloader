@@ -79,6 +79,8 @@ const elements = {
 
   engineList: document.querySelector('#engine-list'),
   engineNote: document.querySelector('#engine-note'),
+  engineUpdateNote: document.querySelector('#engine-update-note'),
+  updateEngines: document.querySelector('#update-engines'),
   engineDirNote: document.querySelector('#engine-dir-note'),
   chooseEnginesDir: document.querySelector('#choose-engines-dir'),
   probeEngines: document.querySelector('#probe-engines'),
@@ -96,6 +98,8 @@ let media = null;
 let analyzing = false;
 let settings = null;
 let queue = { tasks: [], running: 0, limit: 2 };
+// 任务行 DOM 缓存（task.id -> li）：queue:changed 高频到达时，内容没变的行整行复用
+const taskRowCache = new Map();
 let auth = null;
 let engines = null;
 let history = [];
@@ -513,7 +517,8 @@ function updateContextChips() {
 function setAnalyzeBusy(busy) {
   analyzing = busy;
   elements.analyze.disabled = busy;
-  elements.paste.disabled = busy;
+  // 粘贴与解析互不依赖：解析中仍允许粘贴下一条链接
+  elements.paste.disabled = false;
   elements.analyze.dataset.busy = String(busy);
   elements.analyzeText.textContent = busy ? '正在解析' : '解析链接';
 }
@@ -524,6 +529,7 @@ const KIND_LABELS = {
   engine_missing: '引擎未安装',
   login_required: '需要登录',
   needs_login: '可能需要登录',
+  blocked_403: '站点拒绝给出媒体流（403，能解析不能取流）',
   site_changed: '站点改版（本机引擎版本落后）',
   unsupported_site: '这条链接该站点不支持',
   unsupported_url: '这不是具体内容页',
@@ -619,15 +625,50 @@ const REMEDY_LABELS = {
   install_engine: '查看引擎状态并重新探测',
   check_network: '检查网络/代理后重试',
   fix_url: '回到输入框改链接',
-  update_engine: '看引擎版本并考虑升级',
+  update_engine: '升级引擎（从官方发布下载）',
+  lower_quality: '换低一档画质',
+  reparse: '重新解析（取新直链）',
   check_page_type: '回到输入框换一条内容页链接',
   copy_link: '回到输入框换一条链接',
 };
 
-function runRemedy(remedy, result) {
+// 降一档画质：站点拒绝取流（403）时高码率档最容易撞上，往下一档常能直接下完。
+// 列表是按"最好的在前"排的，所以往后挪一个 option 就是降一档。
+async function stepDownVideoQuality(url) {
+  if (!media && url) {
+    elements.url.value = url;
+    updateContextChips();
+    await analyze();
+  }
+  switchView('home');
+  const select = elements.videoFormat;
+  const values = [...select.options].map((option) => option.value);
+  const index = values.indexOf(select.value);
+  if (index < 0 || index >= values.length - 1) {
+    setStatus('这条链接没有更低的一档可换了，先升级引擎再重试。', 'error');
+    return;
+  }
+  select.selectedIndex = index + 1;
+  syncFormatState();
+  setStatus(`已降到低一档画质：${select.options[index + 1].textContent}。点"下载"重下这条。`, 'success');
+}
+
+function runRemedy(remedy, result, task) {
   switch (remedy.action) {
     case 'login':
       openLogin(contextSiteId || siteOf(elements.url.value.trim())?.id || '');
+      break;
+    case 'lower_quality':
+      void stepDownVideoQuality(task?.url || elements.url.value.trim());
+      break;
+    case 'reparse':
+      if (task?.url) {
+        elements.url.value = task.url;
+        updateContextChips();
+        media = null;
+      }
+      switchView('home');
+      void analyze();
       break;
     case 'open_site':
       void window.qingying.openExternal(elements.url.value.trim());
@@ -653,10 +694,10 @@ function runRemedy(remedy, result) {
       break;
     case 'update_engine':
       switchView('settings');
-      void probeEngines().then(() => {
-        elements.engineList.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        setStatus('已列出本机引擎版本。站点改版时先升级 yt-dlp / gallery-dl（例如 yt-dlp -U），再点"重新探测"。');
-      });
+      void probeEngines().then(() => elements.engineList.scrollIntoView({ behavior: 'smooth', block: 'center' }));
+      // 直接把升级跑起来：这个按钮就是"考虑升级"这句话的具体形状，让用户再找一次入口
+      // 只会把一次点击变成三次。
+      elements.updateEngines.click();
       break;
     case 'check_page_type':
     case 'copy_link':
@@ -917,6 +958,34 @@ async function enqueueCurrent() {
   setStatus(`已加入队列，共 ${result.tasks.length} 个任务。`, 'success');
 }
 
+// 删除只针对列表里的这一条，硬盘上已经下好的文件一律不动 —— 行标签必须把这句话说清，
+// 否则用户点之前要先猜"会不会把我的文件也删了"。
+const DELETE_LABELS = {
+  done: '从列表删除（不动已下载的文件）',
+  failed: '删除这条失败任务',
+  cancelled: '删除这条已取消任务',
+  paused: '删除这条暂停任务（.part 分片留在目录里）',
+  queued: '从队列删除（还没开始）',
+  downloading: '停止并删除（.part 分片留在目录里）',
+};
+
+async function removeTaskRow(task) {
+  let removed = false;
+  try {
+    removed = await window.qingying.removeTask(task.id);
+  } catch {
+    setStatus('删除没送达主进程，界面与队列可能不一致，刷新一下队列。', 'error');
+    return;
+  }
+  taskRowCache.delete(task.id);
+  if (!removed) {
+    // 主进程说这条已经不在了：队列快照是推过来的，行会自己消失，这里只交代原因。
+    setStatus('这条任务已经不在了（可能刚被清除），列表会自己刷新。');
+    return;
+  }
+  setStatus(`${DELETE_LABELS[task.status] || '已从列表删除'}：${task.title || safeHost(task.url) || '这条任务'}。已下载的文件没有改动。`, 'success');
+}
+
 function renderQueue(snapshot) {
   if (snapshot) queue = snapshot;
   const openMenu = elements.taskList.querySelector('.row-menu[open]');
@@ -938,9 +1007,18 @@ function renderQueue(snapshot) {
   elements.taskEmpty.textContent = tasks.length
     ? (queueFilter === 'done' ? '还没有已完成的任务。' : '没有未完成的任务。')
     : '队列是空的，解析一条链接后加入下载。';
-  elements.taskList.replaceChildren();
 
+  // keyed 行更新：下载期间 queue:changed 每秒约 6 拍，逐行整行重建会一直拆掉
+  // 进度条/hover/打开着的行菜单。内容没变的行直接复用 DOM（dataset.sig 比对），
+  // 只有真变化的行才重建。
+  const frag = document.createDocumentFragment();
   for (const task of [...visibleTasks].reverse()) {
+    const signature = JSON.stringify(task);
+    const cached = taskRowCache.get(task.id);
+    if (cached && cached.dataset.sig === signature) {
+      frag.append(cached);
+      continue;
+    }
     const item = document.createElement('li');
     item.className = `task-row status-${task.status}`;
     item.dataset.taskId = task.id;
@@ -992,7 +1070,7 @@ function renderQueue(snapshot) {
         remedies.className = 'task-remedies';
         for (const remedy of (task.remedies || []).slice(0, 4)) {
           const button = makeButton(REMEDY_LABELS[remedy.action] || remedy.label, 'remedy-button', () => {
-            if (remedy.action === 'login' || remedy.action === 'open_site') {
+            if (remedy.action === 'login' || remedy.action === 'open_site' || remedy.action === 'lower_quality' || remedy.action === 'reparse') {
               elements.url.value = task.url || '';
               updateContextChips();
             }
@@ -1000,7 +1078,7 @@ function renderQueue(snapshot) {
               void window.qingying.retryTask(task.id);
               return;
             }
-            runRemedy(remedy, null);
+            runRemedy(remedy, null, task);
           });
           if (remedy.detail) button.title = remedy.detail;
           remedies.append(button);
@@ -1040,6 +1118,17 @@ function renderQueue(snapshot) {
       controls.append(button);
     }
 
+    // 删除按钮直接摆在行上：它藏在"更多操作"里时，用户找不到，只能任由列表越积越长。
+    const removeButton = document.createElement('button');
+    removeButton.type = 'button';
+    removeButton.className = 'icon-button danger';
+    removeButton.dataset.removeTask = task.id;
+    removeButton.title = DELETE_LABELS[task.status] || '从列表删除';
+    removeButton.setAttribute('aria-label', DELETE_LABELS[task.status] || '从列表删除');
+    removeButton.append(iconNode('trash'));
+    removeButton.addEventListener('click', () => void removeTaskRow(task));
+    controls.append(removeButton);
+
     const menu = document.createElement('details');
     menu.className = 'row-menu';
     const summary = document.createElement('summary');
@@ -1067,9 +1156,10 @@ function renderQueue(snapshot) {
     if (['downloading', 'queued', 'paused'].includes(task.status)) {
       addMenuItem('取消任务', 'close', () => window.qingying.cancelTask(task.id));
     }
-    if (task.status === 'done' && task.file_count) {
-      addMenuItem('删除记录', 'trash', () => window.qingying.removeTask(task.id));
-    }
+    // 删除对每一行都要存在：失败/取消/已下载完的行不能留在列表里出不去
+    // （原来只有"已完成且有文件"的行才有删除项，失败的行只能眼看着它们堆积）。
+    // 只删队列里的这一条记录，不碰已经下载到硬盘上的文件。
+    addMenuItem(DELETE_LABELS[task.status] || '从列表删除', 'trash', () => void removeTaskRow(task));
     if (task.status === 'done' && task.files?.length) {
       const files = document.createElement('div');
       files.className = 'menu-files';
@@ -1097,8 +1187,16 @@ function renderQueue(snapshot) {
     }
 
     item.append(thumb, main, controls);
-    elements.taskList.append(item);
+    item.dataset.sig = signature;
+    taskRowCache.set(task.id, item);
+    frag.append(item);
   }
+
+  const liveIds = new Set(tasks.map((task) => task.id));
+  for (const id of [...taskRowCache.keys()]) {
+    if (!liveIds.has(id)) taskRowCache.delete(id);
+  }
+  elements.taskList.replaceChildren(frag);
 
   if (openTaskId) {
     const row = [...elements.taskList.querySelectorAll('.task-row')].find((node) => node.dataset.taskId === openTaskId);
@@ -1160,6 +1258,23 @@ function redoHistory(item) {
   void analyze();
 }
 
+async function removeHistoryRow(item) {
+  let removed = false;
+  try {
+    removed = await window.qingying.removeHistoryItem(item.id);
+  } catch {
+    setStatus('删除记录没送达主进程，记录还在。', 'error');
+    return;
+  }
+  if (!removed) {
+    setStatus('这条记录已经不在了（可能刚被清空），列表按主进程的实际记录重画。');
+    void window.qingying.historyList().then((result) => renderHistory(result?.items || []));
+    return;
+  }
+  renderHistory((history || []).filter((entry) => entry.id !== item.id));
+  setStatus(`已删除这条记录：${item.title || safeHost(item.url) || '未命名'}。已下载的文件没有改动。`, 'success');
+}
+
 function renderHistory(items) {
   if (items) history = items;
   const list = history || [];
@@ -1207,6 +1322,16 @@ function renderHistory(items) {
     again.addEventListener('click', () => redoHistory(item));
     controls.append(again);
 
+    const removeButton = document.createElement('button');
+    removeButton.type = 'button';
+    removeButton.className = 'icon-button danger';
+    removeButton.dataset.removeHistory = item.id;
+    removeButton.title = '删除这条记录（不动已下载的文件）';
+    removeButton.setAttribute('aria-label', '删除这条记录');
+    removeButton.append(iconNode('trash'));
+    removeButton.addEventListener('click', () => void removeHistoryRow(item));
+    controls.append(removeButton);
+
     const menu = document.createElement('details');
     menu.className = 'row-menu';
     const summary = document.createElement('summary');
@@ -1234,6 +1359,7 @@ function renderHistory(items) {
       setStatus('链接已复制。', 'success');
     });
     addMenuItem('再下一次', 'retry', () => redoHistory(item));
+    addMenuItem('删除这条记录（不动已下载的文件）', 'trash', () => void removeHistoryRow(item));
     menu.append(summary, panel);
     controls.append(menu);
 
@@ -1355,49 +1481,60 @@ async function runBatch() {
   elements.batchRun.disabled = true;
   const items = [];
   let failed = 0;
-  for (const [index, url] of urls.entries()) {
-    setStatus(`批量解析 ${index + 1}/${urls.length}…`);
-    const result = await window.qingying.analyze(url, '');
-    if (!result?.ok) {
-      failed += 1;
-      continue;
+  const failedUrls = [];
+  try {
+    for (const [index, url] of urls.entries()) {
+      setStatus(`批量解析 ${index + 1}/${urls.length}…`);
+      let result = null;
+      try {
+        result = await window.qingying.analyze(url, '');
+      } catch (error) {
+        result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+      if (!result?.ok) {
+        failed += 1;
+        failedUrls.push(url);
+        continue;
+      }
+      const data = result.data;
+      const imagesOnly = data.images?.length && !data.videos.length && !data.audios.length;
+      if (imagesOnly) {
+        items.push({
+          url: data.webpageUrl, title: data.title, mode: 'images', images: data.images,
+          site: data.sessionId || '', engine: data.engine, outputDir: elements.folder.value.trim(),
+        });
+      } else {
+        const video = data.videos[0] || null;
+        const audio = data.audios[0] || null;
+        items.push({
+          url: data.webpageUrl,
+          title: data.title,
+          mode: video ? 'combined' : 'audio',
+          videoId: video?.id || '',
+          videoExt: video?.ext || '',
+          videoHasAudio: Boolean(video?.hasAudio),
+          audioId: audio?.id || '',
+          audioExt: audio?.ext || '',
+          audioFormat: settings?.audioFormat || 'mp3',
+          site: data.sessionId || '',
+          engine: data.engine,
+          outputDir: elements.folder.value.trim(),
+        });
+      }
     }
-    const data = result.data;
-    const imagesOnly = data.images?.length && !data.videos.length && !data.audios.length;
-    if (imagesOnly) {
-      items.push({
-        url: data.webpageUrl, title: data.title, mode: 'images', images: data.images,
-        site: data.sessionId || '', engine: data.engine, outputDir: elements.folder.value.trim(),
-      });
-    } else {
-      const video = data.videos[0] || null;
-      const audio = data.audios[0] || null;
-      items.push({
-        url: data.webpageUrl,
-        title: data.title,
-        mode: video ? 'combined' : 'audio',
-        videoId: video?.id || '',
-        videoExt: video?.ext || '',
-        videoHasAudio: Boolean(video?.hasAudio),
-        audioId: audio?.id || '',
-        audioExt: audio?.ext || '',
-        audioFormat: settings?.audioFormat || 'mp3',
-        site: data.sessionId || '',
-        engine: data.engine,
-        outputDir: elements.folder.value.trim(),
-      });
-    }
+  } finally {
+    // 解析中途抛错也不能把按钮卡死在禁用态
+    elements.batchRun.disabled = false;
   }
-  elements.batchRun.disabled = false;
   if (!items.length) {
-    setStatus(`${urls.length} 条链接都没解析成功，一个任务也没加入。`, 'error');
+    setStatus(`${urls.length} 条链接都没解析成功，一个任务也没加入。${failedUrls.length ? `失败的链接：${failedUrls.join('  ')}` : ''}`, 'error');
     return;
   }
   await window.qingying.submitQueue(items);
   setWorkflow(3);
   setQueueFilter('all');
   switchView('queue');
-  setStatus(`已加入 ${items.length} 个任务${failed ? `，${failed} 条解析失败被跳过` : ''}。`, 'success');
+  setStatus(`已加入 ${items.length} 个任务${failed ? `，${failed} 条解析失败被跳过${failedUrls.length ? `：${failedUrls.join('  ')}` : ''}` : ''}。`, failed ? 'error' : 'success');
 }
 
 // 平台快捷入口：切到输入框，剪贴板里正好是该站点的链接就顺手填上。
@@ -1415,13 +1552,13 @@ async function quickSite(siteId) {
     elements.url.value = text;
     hideMediaResult();
     updateContextChips();
-    setEmptyState('idle', `已填入 ${label} 链接`, '按回车或点“解析”开始。');
-    setStatus('已从剪贴板填入链接。', 'success');
+    setEmptyState('idle', `已填入 ${label} 链接`, '正在解析…');
+    setStatus('已从剪贴板填入链接，开始解析。', 'success');
+    void analyze();
   } catch {
     // 剪贴板不可读时保持手动粘贴。
   }
 }
-
 // ── 事件接线 ──────────────────────────────────────────────────────────────
 elements.paste.addEventListener('click', async () => {
   try {
@@ -1440,10 +1577,17 @@ elements.paste.addEventListener('click', async () => {
     }
     elements.url.value = trimmed;
     hideMediaResult();
-    setEmptyState('idle', '链接已粘贴', '确认无误后点"解析链接"。');
     updateContextChips();
-    setStatus('已从剪贴板读取链接。');
-    elements.url.focus();
+    if (/^https?:\/\//i.test(trimmed)) {
+      // 粘贴进来的已经是链接：直接解析，少点一次"解析链接"
+      setEmptyState('idle', '链接已粘贴', '正在解析…');
+      setStatus('已从剪贴板读取链接，开始解析。');
+      void analyze();
+    } else {
+      setEmptyState('idle', '链接已粘贴', '确认无误后点"解析链接"。');
+      setStatus('已从剪贴板读取链接。');
+      elements.url.focus();
+    }
   } catch {
     setStatus('无法读取剪贴板。', 'error');
   }
@@ -1526,7 +1670,7 @@ elements.audioOutput.addEventListener('change', syncFormatState);
 elements.download.addEventListener('click', () => void enqueueCurrent());
 elements.clearFinished.addEventListener('click', async () => {
   const result = await window.qingying.clearFinished();
-  setStatus(`已清除 ${result?.removed ?? 0} 条结束的任务。`, 'success');
+  setStatus(`已清除 ${result?.removed ?? 0} 条已结束的任务（含失败的），下载好的文件没有改动。`, 'success');
 });
 
 elements.chooseFolder.addEventListener('click', async () => {
@@ -1580,6 +1724,52 @@ elements.clearHistory.addEventListener('click', async () => {
   setStatus('下载记录已清空。', 'success');
 });
 elements.probeEngines.addEventListener('click', () => void probeEngines());
+
+// 引擎检查更新：站点改版（YouTube 的 403 就是这类）不该只能等作者重新出包。
+// 一次点击走完"问版本 → 下载 → 校验 sha256 → 替换 → 重新探测"，中间每一步都说实话。
+elements.updateEngines.addEventListener('click', async () => {
+  const note = (text) => {
+    elements.engineUpdateNote.textContent = text;
+  };
+  elements.updateEngines.disabled = true;
+  note('正在向官方发布页确认版本…');
+  try {
+    const check = await window.qingying.enginesCheckUpdate();
+    const items = check?.items || [];
+    const stale = items.filter((item) => item.needs_update);
+    if (!items.length) {
+      note('没拿到官方版本信息，本机引擎没有改动。');
+      return;
+    }
+    if (!stale.length) {
+      note('已经是官方最新版：' + items.map((item) => `${item.name} ${item.installed || '未探测到'}`).join('、') + '。');
+      return;
+    }
+    note(`官方有新版本：${stale.map((item) => `${item.name} ${item.installed || '?'} → ${item.latest}`).join('、')}，正在下载并校验…`);
+    const result = await window.qingying.enginesUpdate();
+    if (result?.engines) {
+      engines = result.engines;
+      renderEngines();
+    }
+    const results = result?.results || [];
+    const upgraded = results.filter((item) => item.ok && !item.unchanged);
+    const failed = results.filter((item) => !item.ok);
+    const parts = [];
+    if (upgraded.length) {
+      parts.push(`已升级：${upgraded.map((item) => `${item.name} ${item.from || '?'} → ${item.version}`).join('、')}`);
+    }
+    if (failed.length) {
+      parts.push(`没换成：${failed.map((item) => `${item.name} —— ${item.error}`).join('；')}`);
+    }
+    if (!parts.length) parts.push('本机引擎没有改动。');
+    note(parts.join('　') + (upgraded.length ? '（下载目录已在"引擎目录"里指向本机升级目录，直接重试失败的任务即可。）' : ''));
+    setStatus(upgraded.length ? '引擎已升级，去队列里点"重试"就能用新版本。' : '引擎没有变化，详见下载引擎面板。', upgraded.length ? 'success' : 'error');
+  } catch (error) {
+    note('升级失败：' + (error?.message || '主进程没有响应') + '。本机引擎没有改动。');
+  } finally {
+    elements.updateEngines.disabled = false;
+  }
+});
 
 elements.chooseEnginesDir.addEventListener('click', async () => {
   try {
@@ -1655,6 +1845,7 @@ window.qingying.onEnginesChanged((record) => {
   renderEngines();
 });
 window.qingying.onApiStatus((record) => renderApiStatus(record));
+window.qingying.onHistoryChanged((snapshot) => renderHistory(snapshot?.items || []));
 
 // ── 启动 ──────────────────────────────────────────────────────────────────
 setMode('combined');

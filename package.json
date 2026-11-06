@@ -1,6 +1,6 @@
 {
   "name": "qingying-downloader",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "A secure Electron frontend for yt-dlp and gallery-dl with automatic engine routing, batch queue, per-site login sessions and a local Agent API.",
   "main": "electron/main.cjs",
   "author": "Codex",
@@ -10,6 +10,10 @@
     "build": "node scripts/build.cjs",
     "dist": "node scripts/build.cjs --installer",
     "check": "node scripts/check.cjs",
+    "check:api": "node scripts/api-guard.test.cjs",
+    "check:mutate": "node scripts/mutation-bench.cjs",
+    "ui:verify": "node scripts/ui-verify.cjs",
+    "repro:youtube": "node scripts/repro-youtube.cjs",
     "verify": "node scripts/verify.cjs",
     "agent:serve": "node agent/server.mjs",
     "agent:mcp": "node agent/mcp-server.mjs",
